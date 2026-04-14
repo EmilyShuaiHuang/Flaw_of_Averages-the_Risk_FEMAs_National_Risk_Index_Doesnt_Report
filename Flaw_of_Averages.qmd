@@ -1,0 +1,2796 @@
+---
+title: "Flaw of Averages: the Risk FEMA’s National Risk Index Doesn’t Report"
+author: "Emily Huang"
+format: 
+  html: 
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: true
+    code-summary: "Show Code"
+    theme: cosmo
+    fig-width: 10
+    fig-height: 5
+    df-print: paged
+    embed-resources: true
+editor: 
+  markdown: 
+    wrap: 70
+---
+
+# NRI Reconstruction
+
+## Load Packages
+
+```{r initial_setup}
+#| label: initial setup
+
+# Loading packages 
+library(tidyverse)
+library(conflicted) # To resikve name conflicts between packages
+library(scales)
+library(patchwork)
+library(mvtnorm) # For t-copula
+library(fitdistrplus) # To fit historical data to distribution via MLE
+#library(copula)
+library(nortest) # For Anderson-Darling goodness-of-fit test 
+#library(Matrix)
+library(knitr) # For ktables, which makes nice tables
+library(kableExtra) # For more table creation and styling abilities
+library(pscl) # For functions to handle zero-inflated Poisson model
+
+# Resolve conflict between packages
+conflict_prefer("select",    "dplyr")
+conflict_prefer("filter",    "dplyr")
+conflict_prefer("summarise", "dplyr")
+conflict_prefer("rename",    "dplyr")
+conflict_prefer("lag",       "dplyr")
+```
+
+## Purpose
+
+This document contains all the R code for my senior project. In
+particular, it includes 1) the reconstruction of FEMA's National Risk
+Index (NRI) for New York County (Manhattan, FIPS 36061) using FEMA's
+published technical documentation and loss data from SHELDUS and 2)
+improving FEMA's point-estimate measure of risk by replacing 3 of the
+NRI input variables with fitted probability distributions and
+recalculate the risk with a Monte Carlo Simulation of 100,000 random
+draws. The goal is to make a point that FEMA's report of a single
+mean-based risk value is a gross oversimplification of the actual risk
+experienced by communities, especially when the probability
+distribution of variables that contribute to the risk calculation
+often have fat tails.
+
+**Note:** Within the period that we are looking at, New York County
+(Manhattan) has zero recorded riverine flooding building losses in the
+SHELDUS data set (1960-2022) because losses from hurricane Sandy was
+recorded under "Hurricane/Tropical Storm" instead. Thus, I was not
+able to fit a distribution through MLE with 0 observations. FEMA
+accounted for this through their own proprietory processing, which I
+wasn't able to replicate. So for the Monte Carlo Simulation, we used
+RFDL data from a larger geographical scale, NY state regional scale
+LRB, by pooling loss ratio observations from all counties across NYS
+that did have recorded riverine flood losses to fit the distribution.
+This fallback likely made the RFLD component conservative by
+understating the true risk experienced by members of the New York
+County. Underestimation is likely the case because Manhattan has the
+higher building value per square mile than any other counties in New
+York State, so when a flood hits, the dollar loss amount should be
+much higher relative to most NYS counties.
+
+## Load Data
+
+Two data sources are loaded here, 1) SHELDUS historical loss records
+and 2) FEMA's published National Risk Index and their input variables.
+
+1.  **SHELDUS v24** (Feburary 2026): https://cemhs.asu.edu/sheldus
+
+2.  **FEMA NRI v1.20** (December 2025):
+    https://www.fema.gov/flood-maps/products-tools/national-risk-index
+
+**Note:** FEMA's NRI v1.20 selected specific date ranges for the
+SHELDUS data, which is unbeknownst to me. To resokve this, I used
+min/max year for each hazard in the county from the SHELDUS data
+instead, which likely is the cause of discrepencies in Annualized
+Frequency component of the reconstructed NRI.
+
+```{r load_data}
+sheldus_raw <- read_csv(
+  "C:/Users/emily/Desktop/Econ-Fin Senior Project/FEMA NRI/data/Other/SHELDUS.csv",
+  show_col_types = FALSE
+) %>%
+  rename(
+    prop_dmg_adj = `PropertyDmg(ADJ 2022)`,
+    crop_dmg_adj = `CropDmg(ADJ 2022)`
+  )
+
+nri <- read_csv(
+  "C:/Users/emily/Desktop/Econ-Fin Senior Project/FEMA NRI/data/NRI_Table_Counties.csv",
+  show_col_types = FALSE
+)
+
+ny <- nri %>% filter(STCOFIPS == "36061") # ny is for new york county only (manhattan)
+
+```
+
+## Geographical Scales
+
+FEMA's Bayesian credibility analysis pools Loss Ratio Basis (LRB)
+across 4 nested geographical levels (county, surrounding, regional,
+and national) to update estimations of risk for data-sparse counties
+by blending data with broader geographical scale.
+
+```{r scales}
+#| label: scales
+
+# County: New York County only
+fips_county <- 36061
+
+# Surrounding: the five NYC boroughs plus adjacent NJ metro counties
+fips_surrounding <- c(    
+  36005,  # Bronx
+  36047,  # Kings (Brooklyn)
+  36081,  # Queens
+  36085,  # Richmond (Staten Island)
+  34017,  # Hudson, NJ
+  34003,  # Bergen, NJ
+  34013,  # Essex, NJ
+  36119   # Westchester, NY
+)
+
+# Regional: all New York State counties (FIPS 36***)
+fips_regional <- nri %>%
+  filter(str_starts(as.character(STCOFIPS), "36")) %>%
+  pull(STCOFIPS)
+
+# National: all counties in SHELDUS
+fips_national <- unique(sheldus_raw$County_FIPS)
+
+# Extract SHELDUS subsets for each scale
+sheldus_county   <- sheldus_raw %>% filter(County_FIPS == fips_county)
+sheldus_surround <- sheldus_raw %>% filter(County_FIPS %in% fips_surrounding)
+sheldus_regional <- sheldus_raw %>% filter(County_FIPS %in% fips_regional)
+sheldus_national <- sheldus_raw
+
+
+# SHELDUS record counts at each geographic scale
+tibble(
+  Scale      = c("County", "Surrounding", "Regional (NY State)", "National"),
+  n_counties = c(1, length(fips_surrounding),
+                 length(fips_regional), length(fips_national)),
+  n_rows     = c(nrow(sheldus_county), nrow(sheldus_surround),
+                 nrow(sheldus_regional), nrow(sheldus_national))
+) %>%
+  kable(caption = "SHELDUS record counts at each geographic scale") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Hazard Mapping
+
+We map SHELDUS's free-text label to NRI's hazard names and define
+occurrence basis using FEMA's Hazard Occurrence basis chart. There are
+only 12 active NRI hazard types applicable to New York County. Hazards
+ommitted from Manhattan includes Avalanche, Volcano, Tsunami,
+Wildfire, Drought and Landslide.
+
+```{r hazards}
+# SHELDUS label -> NRI prefix and occurrence basis
+#   "event"      = distinct events (count rows)
+#   "event_day"  = event-days (sum Duration_Days)
+hazard_map <- tribble(
+  ~sheldus_label,               ~nri_prefix, ~occurrence_basis,
+  "Flooding",                   "RFLD",      "event_day",
+  "Coastal",                    "CFLD",      "none",
+  "Hurricane/Tropical Storm",   "HRCN",      "event",
+  "Severe Storm/Thunder Storm", "SWND",      "event",
+  "Wind",                       "SWND",      "event",
+  "Winter Weather",             "WNTW",      "event_day",
+  "Hail",                       "HAIL",      "event",
+  "Lightning",                  "LTNG",      "event",
+  "Heat",                       "HWAV",      "event_day",
+  "Tornado",                    "TRND",      "event",
+  "Fog",                        "SWND",      "event"
+)
+
+active_hazards <- c("CFLD","RFLD","HRCN","ERQK","SWND","TRND",
+                    "HAIL","LTNG","HWAV","CWAV","WNTW","ISTM")
+
+hazard_map %>%
+  kable(caption = "SHELDUS label → NRI prefix mapping") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## SHELDUS Pre-Processing
+
+According to FEMA's technical documentation, there is a 3-step
+pre-processing procedure to prepare SHELDUS records for FEMA's NRI
+calculations:
+
+1.  **Record expansion:** divides multi-day event losses equally
+    across days. We do this because event-day hazards (like RFLD,
+    WNTW, or HWAV) count Duration_Days as the frequency denominator;
+    without expansion, all loss from a 5-day flood would be attributed
+    to a single day-count, which might lead to overestimating.
+
+2.  **Record aggregation:** merges records with the same county, year,
+    month, and hazard into one row, preventing double-counting
+    events/event days
+
+3.  **Zero-loss insertion:** when historical occurrence data indicates
+    more events than loss-causing records, zero-loss records are
+    inserted to avoid overestimating average impact. This is done
+    already because instead of inserting lrb=0 for all row without
+    occurrences, the formula used the whole period of record as
+    denominator. This essentially makes sure we consider this.
+
+```{r pre-processing}
+event_day_labels <- c("Flooding", "Winter Weather", "Heat")
+
+expand_to_daily <- function(df) {   # function for record expansion (step 1)
+  event_rows     <- df %>% filter(Hazard %in% event_day_labels, Duration_Days > 1)
+  non_event_rows <- df %>% filter(!(Hazard %in% event_day_labels & Duration_Days > 1))
+  expanded <- event_rows %>%
+    uncount(Duration_Days, .id = "day_id", .remove = FALSE) %>%
+    mutate(
+      prop_dmg_adj  = prop_dmg_adj  / Duration_Days,
+      crop_dmg_adj  = crop_dmg_adj  / Duration_Days,
+      Fatalities    = Fatalities    / Duration_Days,
+      Injuries      = Injuries      / Duration_Days,
+      Duration_Days = 1L
+    )
+  bind_rows(non_event_rows, expanded)
+}
+
+# perform step 1 to all four geographical levels
+sheldus_expanded_county   <- expand_to_daily(sheldus_county)
+sheldus_expanded_surround <- expand_to_daily(sheldus_surround)
+sheldus_expanded_regional <- expand_to_daily(sheldus_regional)
+sheldus_expanded_national <- expand_to_daily(sheldus_national)
+
+aggregate_records <- function(df) {   # function for aggregating records (step 2)
+  df %>%
+    group_by(County_FIPS, Hazard, Year, Month) %>%
+    summarise(
+      prop_dmg_adj  = sum(prop_dmg_adj,  na.rm = TRUE),
+      crop_dmg_adj  = sum(crop_dmg_adj,  na.rm = TRUE),
+      Fatalities    = sum(Fatalities,    na.rm = TRUE),
+      Injuries      = sum(Injuries,      na.rm = TRUE),
+      Duration_Days = sum(Duration_Days, na.rm = TRUE),
+      n_records     = n(),
+      .groups       = "drop"
+    )
+}
+
+# perform step 2 to all four geographical levels
+sheldus_county_clean   <- aggregate_records(sheldus_expanded_county)
+sheldus_surround_clean <- aggregate_records(sheldus_expanded_surround)
+sheldus_regional_clean <- aggregate_records(sheldus_expanded_regional)
+sheldus_national_clean <- aggregate_records(sheldus_expanded_national)
+
+
+# create summary table and to check the total property damage remains the same before and after the data processing
+tibble(
+  Step            = c("Raw", "After expansion", "After aggregation"),
+  Total_Prop_Loss = c(
+    sum(sheldus_county$prop_dmg_adj,          na.rm = TRUE),
+    sum(sheldus_expanded_county$prop_dmg_adj, na.rm = TRUE),
+    sum(sheldus_county_clean$prop_dmg_adj,    na.rm = TRUE)
+  )
+) %>%
+  mutate(Total_Prop_Loss = dollar(round(Total_Prop_Loss))) %>%
+  kable(caption = "Loss preservation check: total property damage through pre-processing") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Exposure
+
+Exposure is the dollar value of the assets under risk due to natural
+hazards. We use FEMA's pre-computed NRI table directly because the
+Hazus/CoreLogic data is proprietary. If we use raw data to calculate
+on our own, there will be a large discrepancy and room for error when
+we compare our reconstructed NRI with FEMA's due to lack of data
+transparency. The population column (`_EXPP`) is a person count; we
+convert to dollars using FEMA's implied VSL of \$13,702,913, which is
+back-calculated from Cold Wave totals.
+
+```{r exposure}
+#| label: exposure
+
+FEMA_VSL <- 13702913
+
+# Calculating exposure for all active hazards
+exposure_ny <- map_dfr(active_hazards, function(haz) {
+  expb_col <- paste0(haz, "_EXPB")
+  expp_col <- paste0(haz, "_EXPP")
+  expa_col <- paste0(haz, "_EXPA")
+  expb <- if (expb_col %in% names(ny)) replace_na(ny[[expb_col]], 0) else 0
+  expp <- if (expp_col %in% names(ny)) replace_na(ny[[expp_col]], 0) * FEMA_VSL else 0
+  expa <- if (expa_col %in% names(ny)) replace_na(ny[[expa_col]], 0) else 0
+  tibble(
+    nri_prefix       = haz,
+    consequence      = c("Building", "Population", "Agriculture"),
+    exposure_density = c(expb, expp, expa)
+  )
+}) %>%
+  filter(exposure_density > 0)
+
+# Verification for CWAV because it is the only hazard that lets me confirm the VSL conversion factor is right.
+ny %>%
+  select(CWAV_EXPB, CWAV_EXPP, CWAV_EXPA, CWAV_EXPT) %>%
+  mutate(
+    recon_expt = CWAV_EXPB + CWAV_EXPP * FEMA_VSL + replace_na(CWAV_EXPA, 0),
+    ratio      = round(recon_expt / CWAV_EXPT, 4)
+  ) %>%
+  kable(caption = "VSL verification: ratio should be 1.00") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Annualized Frequency
+
+The annualized frequency is calculated by $AF$ = occurrence count ÷
+period of record. This is part of the 3 multiplicative terms that we
+need to get the Estimated Annual Loss estimation for Manhattan
+$EAL = \text{Exposure} \times AF \times HLR$.
+
+**Note:** Notice from the formula that value for annualized frequency
+depends on the period of record, but FEMA does not publish the exact
+window in which they extracted SHELDUS data from. We use the min/max
+year to find period of record in our SHELDUS dataset to determine PoR
+(period of Record) for each hazard. This mismatch results in different
+set of hazard, and therefore their losses, to be considered in our
+reconstruction. Thus, there are discrepancies in our risk estimate
+when compared to FEMA's published estimates.
+
+```{r frequency}
+#| label: frequency
+
+empirical_por <- sheldus_county_clean %>%
+  group_by(Hazard) %>%
+  summarise(
+    min_year      = min(Year),
+    max_year      = max(Year),
+    por_empirical = max(Year) - min(Year) + 1,
+    .groups       = "drop"
+  )
+
+por_override <- tribble(
+  ~sheldus_label,               ~por_fema,
+  "Flooding",                    NA_real_,
+  "Hurricane/Tropical Storm",    NA_real_,
+  "Winter Weather",              NA_real_,
+  "Severe Storm/Thunder Storm",  NA_real_,
+  "Wind",                        NA_real_,
+  "Heat",                        NA_real_,
+  "Hail",                        NA_real_,
+  "Lightning",                   NA_real_,
+  "Tornado",                     NA_real_
+)
+
+por_table <- empirical_por %>%
+  left_join(por_override, by = c("Hazard" = "sheldus_label")) %>%
+  mutate(por_used = if_else(!is.na(por_fema), por_fema, por_empirical))
+
+compute_af_county <- function(df_clean, por_tbl, hazard_label, basis) {
+  sub <- df_clean  %>%  filter(County_FIPS == fips_county, Hazard == hazard_label)
+  por <- por_tbl %>% filter(Hazard == hazard_label) %>% pull(por_used)
+  if (length(por) == 0 || is.na(por)) por <- 1
+  occurrence_count <- if (basis == "event_day") {
+    sum(sub$Duration_Days, na.rm = TRUE)
+  } else {
+    nrow(sub)
+  }
+  tibble(
+    sheldus_label    = hazard_label,
+    basis            = basis,
+    occurrence_count = occurrence_count,
+    por_years        = por,
+    af               = occurrence_count / por
+  )
+}
+
+af_inputs <- hazard_map %>%
+  select(sheldus_label, nri_prefix, occurrence_basis) %>%
+  filter(occurrence_basis != "none") %>%
+  distinct(sheldus_label, .keep_all = TRUE)
+
+af_county <- pmap_dfr(
+  list(af_inputs$sheldus_label, af_inputs$occurrence_basis),
+  function(lbl, basis) compute_af_county(sheldus_county_clean, por_table, lbl, basis)
+) %>%
+  left_join(af_inputs, by = "sheldus_label")
+
+
+af_county_dedup <- af_county %>%
+  group_by(nri_prefix) %>%
+  slice_max(af, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# FEMA published AF for comparison
+af_fema_lookup <- tibble(
+  nri_prefix = unique(af_inputs$nri_prefix),
+  af_fema    = map_dbl(unique(af_inputs$nri_prefix), ~ {
+    col <- paste0(.x, "_AFREQ")
+    if (col %in% names(ny)) ny[[col]] else NA_real_
+  })
+)
+
+# Compare to FEMA published annualized frequency where available
+af_compare <- af_county_dedup %>%
+  left_join(af_fema_lookup, by = "nri_prefix") %>%
+  mutate(ratio_to_fema = round(af / af_fema, 3))
+
+af_compare %>%
+  select(sheldus_label, nri_prefix, basis, occurrence_count,
+         por_years, af, af_fema, ratio_to_fema) %>%
+  kable(digits = c(0,0,0,0,0,3,3,3),
+        caption = "Reconstructed vs. FEMA annualized frequency") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Historic Loss Ratio (HLR)
+
+THE HLR is the average of exposed value that is lost per hazard
+occurrence. FEMA estimated using Bayesian Credibility weighting across
+4 of the geographical scales.
+$$LRB_{dhgc} = \frac{\text{Loss}_{dhgc}}{\text{Exposure}_{hgc}} \qquad
+  W_{hgc} = \frac{1/\text{var}_{hgc}}{\sum_g 1/\text{var}_{hgc}} \qquad
+  HLR_{hc} = \sum_g \overline{LRB}_{hgc} \times W_{hgc}$$
+
+### HLR Exposure Data
+
+```{r hlr-exposure}
+#| label: hlr-exposure
+
+hlr_exposure_all_counties <- map_dfr(active_hazards, function(haz) {
+  expb_col <- paste0(haz, "_EXPB")
+  expp_col <- paste0(haz, "_EXPP")
+  expa_col <- paste0(haz, "_EXPA")
+  nri %>%
+    select(STCOFIPS, any_of(c(expb_col, expp_col, expa_col))) %>%
+    mutate(
+      nri_prefix = haz,
+      hlr_exp_b  = if (expb_col %in% names(nri)) replace_na(.data[[expb_col]], 0) else 0,
+      hlr_exp_p  = if (expp_col %in% names(nri)) replace_na(.data[[expp_col]], 0) * FEMA_VSL else 0,
+      hlr_exp_a  = if (expa_col %in% names(nri)) replace_na(.data[[expa_col]], 0) else 0
+    ) %>%
+    select(STCOFIPS, nri_prefix, hlr_exp_b, hlr_exp_p, hlr_exp_a) %>%
+    pivot_longer(
+      cols      = c(hlr_exp_b, hlr_exp_p, hlr_exp_a),
+      names_to  = "consequence",
+      values_to = "hlr_exposure"
+    ) %>%
+    mutate(consequence = case_when(
+      consequence == "hlr_exp_b" ~ "Building",
+      consequence == "hlr_exp_p" ~ "Population",
+      consequence == "hlr_exp_a" ~ "Agriculture"
+    ))
+}) %>%
+  filter(hlr_exposure > 0)
+
+hlr_exposure_all_counties
+```
+
+### Compute LRB
+
+For each geographical scale.
+
+```{r lrb}
+#| label: lrb
+
+# VSL value directly from the technical documentation
+VSL_fatality <- 11.6e6
+VSL_injury   <- VSL_fatality / 10
+
+# function to compute loss ratio basis
+compute_lrbs <- function(df_clean, scale_label, hlr_exp_all) {
+  df_clean %>%
+    left_join(hazard_map, by = c("Hazard" = "sheldus_label")) %>%
+    filter(!is.na(nri_prefix)) %>%
+    mutate(
+      loss_building    = replace_na(prop_dmg_adj, 0),
+      loss_population  = replace_na(Fatalities, 0) * VSL_fatality +
+                         replace_na(Injuries,   0) * VSL_injury,
+      loss_agriculture = replace_na(crop_dmg_adj, 0)
+    ) %>%
+    pivot_longer(
+      cols      = c(loss_building, loss_population, loss_agriculture),
+      names_to  = "loss_type",
+      values_to = "loss"
+    ) %>%
+    mutate(consequence = case_when(
+      loss_type == "loss_building"    ~ "Building",
+      loss_type == "loss_population"  ~ "Population",
+      loss_type == "loss_agriculture" ~ "Agriculture"
+    )) %>%
+    left_join(
+      hlr_exp_all %>% rename(County_FIPS = STCOFIPS),
+      by = c("County_FIPS", "nri_prefix", "consequence")
+    ) %>%
+    filter(!is.na(hlr_exposure), hlr_exposure > 0) %>%
+    mutate(lrb = loss / hlr_exposure, scale = scale_label) %>%
+    select(nri_prefix, consequence, County_FIPS, Year, Month, lrb, scale)
+}
+
+# compute lrb for all 4 of the geographical levels
+lrb_county   <- compute_lrbs(sheldus_county_clean,   "county",      hlr_exposure_all_counties)
+lrb_surround <- compute_lrbs(sheldus_surround_clean, "surrounding", hlr_exposure_all_counties)
+lrb_regional <- compute_lrbs(sheldus_regional_clean, "regional",    hlr_exposure_all_counties)
+lrb_national <- compute_lrbs(sheldus_national_clean, "national",    hlr_exposure_all_counties)
+
+lrb_all <- bind_rows(lrb_county, lrb_surround, lrb_regional, lrb_national)
+
+lrb_all %>% count(scale) %>%
+  kable(caption = "LRB observation counts by geographic scale") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### Bayesian Credibility Weighting
+
+```{r bayesian-hlr}
+#| label: bayesian-hlr
+
+# Following formula to reconstruct the HLR component of NRI, then comparing it to FEMA's
+lrb_stats <- lrb_all %>%
+  group_by(nri_prefix, consequence, scale) %>%
+  summarise(
+    n_events = n(),
+    avg_lrb  = mean(lrb, na.rm = TRUE),
+    var_lrb  = var(lrb,  na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  mutate(var_lrb = if_else(is.na(var_lrb) | var_lrb == 0, 1e-20, var_lrb))
+
+lrb_weights <- lrb_stats %>%
+  group_by(nri_prefix, consequence) %>%
+  mutate(inv_var = 1 / var_lrb, weight = inv_var / sum(inv_var)) %>%
+  ungroup()
+
+hlr_bayesian <- lrb_weights %>%
+  group_by(nri_prefix, consequence) %>%
+  summarise(HLR_bayesian = sum(avg_lrb * weight), .groups = "drop")
+
+hlr_fema_cols <- c(outer(active_hazards, c("_HLRB","_HLRP","_HLRA"), paste0))
+
+hlr_fema <- ny %>%
+  select(any_of(hlr_fema_cols)) %>%
+  pivot_longer(everything(), names_to = "col", values_to = "HLR_fema") %>%
+  mutate(
+    nri_prefix  = str_sub(col, 1, 4),
+    consequence = case_when(
+      str_ends(col, "_HLRB") ~ "Building",
+      str_ends(col, "_HLRP") ~ "Population",
+      str_ends(col, "_HLRA") ~ "Agriculture"
+    )
+  ) %>%
+  select(nri_prefix, consequence, HLR_fema)
+
+hlr_bayesian %>%
+  left_join(hlr_fema, by = c("nri_prefix","consequence")) %>%
+  mutate(
+    ratio        = round(HLR_bayesian / HLR_fema, 3),
+    HLR_bayesian = signif(HLR_bayesian, 5),
+    HLR_fema     = signif(HLR_fema, 5)
+  ) %>%
+  filter(!is.na(HLR_fema)) %>%
+  arrange(nri_prefix, consequence) %>%
+  kable(caption = "Reconstructed vs. FEMA published HLR by hazard-consequence") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## LRB distribution summary
+
+We analyze the Coefficient of Variation (CV=SD/MEAN) of the Loss Ratio
+Basis distribution to help us understand how poorly FEMA's mean-based
+HLR point estimate represents the real variability of loss. For
+hazards with CV\>1, we know the mean is dominated by rare and extreme
+events, which are precisely the ones misrepresented by a mean-based
+point estimate.
+
+```{r cv-analysis}
+#| label: cv-analysis
+#| fig-height: 6
+
+cv_summary <- lrb_all %>%
+  filter(scale == "county") %>%
+  group_by(nri_prefix, consequence) %>%
+  summarise(
+    n  = n(),
+    mean = mean(lrb, na.rm = TRUE),
+    sd   = sd(lrb,   na.rm = TRUE),
+    cv   = sd / mean,
+    .groups = "drop"
+  )
+
+cv_plot <- cv_summary %>%
+  filter(consequence == "Building") %>%
+  mutate(nri_prefix = reorder(nri_prefix, cv))
+
+ggplot(cv_plot, aes(x = nri_prefix, y = cv, fill = cv > 1)) +
+  geom_col(alpha = 0.85, width = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "firebrick", linewidth = 0.9) +
+  scale_fill_manual(
+    values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+    labels = c("FALSE" = "CV ≤ 1", "TRUE" = "CV > 1 (priority for MC)"),
+    name   = NULL
+  ) +
+  annotate("text", x = 0.6, y = 1.05, label = "CV = 1 threshold",
+           color = "firebrick", hjust = 0, size = 3.2) +
+  coord_flip() +
+  labs(
+    title    = "Coefficient of Variation of LRBs by Hazard — Building, County Scale",
+    x = "NRI Hazard Prefix", y = "CV (SD / Mean)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+```
+
+## Expected Annual Loss (EAL)
+
+After calculating the Exposure, Annualized Frequency, and Historic
+Loss Ratio, we assemble all three components to compute the Expected
+Annual Loss. Then we compare it to FEMA's published value.
+
+```{r eal}
+#| label: eal
+
+# Use FEMA's published AF for all hazards. This avoids contaminating the EAL
+af_full <- tibble(
+  nri_prefix = c("ERQK","CWAV","CFLD","ISTM","HWAV","SWND","HRCN",
+                 "HAIL","TRND","LTNG","WNTW","RFLD"),
+  af = map_dbl(c("ERQK","CWAV","CFLD","ISTM","HWAV","SWND","HRCN",
+                 "HAIL","TRND","LTNG","WNTW","RFLD"), ~ {
+    col <- paste0(.x, "_AFREQ")
+    if (col %in% names(ny)) replace_na(ny[[col]], 0) else 0
+  })
+)
+
+hlr_full <- bind_rows(
+  hlr_bayesian %>% rename(HLR = HLR_bayesian),
+  hlr_fema     %>% rename(HLR = HLR_fema) %>%
+    anti_join(hlr_bayesian, by = c("nri_prefix","consequence"))
+)
+
+eal_by_hc <- exposure_ny %>%
+  left_join(af_full,  by = "nri_prefix") %>%
+  left_join(hlr_full, by = c("nri_prefix","consequence")) %>%
+  mutate(
+    af               = replace_na(af, 0),
+    HLR              = replace_na(HLR, 0),
+    exposure_density = replace_na(exposure_density, 0),
+    EAL_hc           = exposure_density * af * HLR
+  ) %>%
+  select(nri_prefix, consequence, exposure_density, af, HLR, EAL_hc) %>%
+  arrange(nri_prefix, consequence)
+
+eal_by_hc %>%
+  mutate(
+    exposure_density = dollar(round(exposure_density)),
+    af               = round(af, 4),
+    HLR              = signif(HLR, 4),
+    EAL_hc           = dollar(round(EAL_hc))
+  ) %>%
+  kable(caption = "EAL per hazard-consequence: EAL = Exposure × AF × HLR") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+eal_by_hazard <- eal_by_hc %>%
+  group_by(nri_prefix) %>%
+  summarise(EAL_h_calc = sum(EAL_hc, na.rm = TRUE), .groups = "drop")
+
+eal_fema_by_hazard <- ny %>%
+  select(any_of(paste0(active_hazards, "_EALT"))) %>%
+  pivot_longer(everything(), names_to = "col", values_to = "EAL_fema") %>%
+  mutate(nri_prefix = str_sub(col, 1, 4)) %>%
+  select(nri_prefix, EAL_fema)
+
+eal_by_hazard %>%
+  left_join(eal_fema_by_hazard, by = "nri_prefix") %>%
+  mutate(
+    ratio      = round(EAL_h_calc / replace_na(EAL_fema, 1), 3),
+    EAL_h_calc = dollar(round(EAL_h_calc)),
+    EAL_fema   = dollar(round(replace_na(EAL_fema, 0)))
+  ) %>%
+  arrange(desc(as.numeric(gsub("[^0-9.]", "", EAL_h_calc)))) %>%
+  kable(col.names = c("Hazard","Reconstructed EAL","FEMA EAL","Ratio"),
+        caption   = "EAL by hazard: Ratio = Reconstructed / FEMA.") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+composite_eal_calc <- sum(eal_by_hc$EAL_hc, na.rm = TRUE)
+composite_eal_fema <- ny$EAL_VALT
+
+
+# comparing our reconstructed EAL with FEMA's
+tibble(
+  Source        = c("Reconstructed", "FEMA Published"),
+  Composite_EAL = dollar(round(c(composite_eal_calc, composite_eal_fema))),
+  Pct_of_FEMA   = round(c(composite_eal_calc / composite_eal_fema * 100, 100), 1)
+) %>%
+  kable(caption = "Composite EAL comparison") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Community Risk Factor
+
+With the Expected Annual Loss computed, the last step to get a risk
+estimate for Manhattan is accounting for their unique Community Risk
+Factor by $$\text{Risk Value} = EAL \times CRF.$$ The CRF is derived
+by ranking the ratio of each county's Social Vulnerability Index (SVI)
+and Community Resilience Index (CRI) nationally and mapping through a
+triangular CDF (with min=0.5, max=2, and mode=1)
+
+```{r crf-rg}
+#| label: crf-rg
+
+crf_data <- nri %>%
+  filter(!is.na(SOVI_SCORE), !is.na(RESL_SCORE), RESL_SCORE > 0) %>%
+  mutate(r_g = SOVI_SCORE / RESL_SCORE)
+
+r_ny <- crf_data %>% filter(STCOFIPS == "36061") %>% pull(r_g)
+
+cat("New York County r_g (SVI/CRI) =", round(r_ny, 4), "\n")
+```
+
+```{r crf-calc}
+#| label: crf-calc
+
+crf_data <- crf_data %>% mutate(percentile_r = percent_rank(r_g))
+percentile_ny <- crf_data %>% filter(STCOFIPS == "36061") %>% pull(percentile_r)
+
+triangular_inv_cdf <- function(x) {
+  case_when(
+    x < 0    ~ 0.5,
+    x > 1    ~ 2.0,
+    x <= 1/3 ~ 0.5 + sqrt(3 * x / 2),
+    TRUE     ~ (4 - sqrt(6 - 6 * x)) / 2
+  )
+}
+
+crf_data    <- crf_data %>% mutate(CRF_calc = triangular_inv_cdf(percentile_r))
+crf_ny_calc <- crf_data %>% filter(STCOFIPS == "36061") %>% pull(CRF_calc)
+crf_ny_fema <- ny$RISK_VALUE / ny$EAL_VALT
+
+
+# comparing the reconstructed Community Resilience with FEMA's 
+tibble(
+  Source     = c("Reconstructed (triangular CDF)", "FEMA Implied (RISK_VALUE/EAL_VALT)"),
+  CRF        = round(c(crf_ny_calc, ny$CRF_VALUE), 5),
+  SVI_value  = rep(round(ny$SOVI_SCORE, 4), 2),
+  CRI_value  = rep(round(ny$RESL_SCORE, 4), 2),
+  r_g        = rep(round(r_ny, 4), 2),
+  Percentile = rep(round(percentile_ny, 4), 2)
+) %>%
+  kable(caption = "CRF comparison: reconstructed vs. FEMA implied") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+**Note:** There is a gap between reconstructed CRF = 1.23 vs. FEMA
+implied = 1.62. Figure out what was wrong is this...
+
+# Monte Carlo
+
+## Purpose
+
+Each of the following component has a whole probability distribution
+of possible values, but FEMA reports a mean-based single point
+estimate instead. $$
+\text{EAL} = \text{Exposure} \times \text{Annualized Frequency} \times \text{Historic Loss Ratio}.
+$$ This results a single point estimation of risk as well, which
+results in the loss of a lot of interesting dimensions of what the
+risk estimate could have been. This singular number hides the fact
+that hazards cause zero losses in most years and causes catastrophic
+damage in a handful of other years. We also will not be able to tell
+if bad floods years and bad tornado years tend to happen together. The
+CV plot above showed that for most hazards, the mean is dominated by a
+few extreme events and are not representative of a typical year.
+
+We wish to illustrate this point more clearly through a Monte Carlo
+simulation by asking, what does the full distribution of Expected
+Annual Loss should actually look like? We first replace 3 input
+variables with a fitted probability distribution based on historical
+data. Then instead of collapsing valuable information to a single
+mean, we simulate 100,000 hypothetical years, each one drawing from
+the fitted probability distributions. At the end of the simulation, we
+will have 100,000 loss values, which is an estimate how a full
+probability distribution of loss should look like.
+
+The three county level variables we replaced with are 1. Annual
+Frequency of Tornado (TRND) 2. Historic Loss Ratio of Flood (RFLD
++CFLD) 3. Historic Loss Ratio of building loss due to Earthquakes
+(ERQK). We first (1) fit each of the three variables to a probability
+distribution separately using their historic SHELDUS data, this is
+called a marginal distribution. Then we (2) simulate all three hazards
+together to account for their natural correlation using the t-Copula.
+
+## Part 1: Marginal Distribution and t-Copula
+
+### Underlying theory
+
+If we only replace one of hazard variables, the simulation will only
+consist of fitting their distribution to the historical data then
+drawing random samples from it. But we are replacing three dependent
+variables, so we must simulate them jointly to account for their
+natural correlation. For examples, when bad tornado years and bad
+flood years tend to occur simultaneously because of severe weather
+seasons. Therefore, we must not naively draw random samples from each
+distributions independently. We also should not fit them to a single
+multivariate distribution to all three because they can have very
+different underlying shapes. Thus, we use a copula to solve this by
+splitting the probability fitting problem into two because we can
+break any joint distribution into two pieces: the shape of each
+individual variable (marginal distribution), and how they move
+together (their dependence). We will specify each piece independently
+and combine them. Formally, by the Skylar's Theorem, for any joint
+distribution $F(x_1, x_2, ..,x_n)$ with individual marginal
+distributions $F_1, F_2, ...,F_n$, there exists a copula function $C$
+such that:
+
+$$
+F(x_1, x_2,..., x_n) = C\bigl(F_1(x_1),\, F_2(x_2),\,..., F_n(x_n)\bigr).
+$$
+
+### The Gaussian Copula
+
+There are many copulas, but we use the t-Copula, which uses the
+correlation structure of a multivariate t-distribution (only the
+correlation structure). Notice the marginal distributions do not need
+to follow a t-distribution to use this correlation structure. The
+t-Copula requires two inputs: the correlation matrix $\mathbf{P}$,
+which is a table of pairwise correlations between each of the three
+hazards, and a degrees of freedom parameter $\nu$, which controls how
+much additional probability is placed on joint tail events. We chose
+the t-Copula over the simpler Gaussian Copula because the Gaussian
+Copula has asymptotically zero tail dependence (it assigns
+increasingly little probability to two hazards being simultaneously
+extreme, even when their correlation is nonzero). The t-Copula
+corrects this by placing more weight on joint tail outcomes, which is
+precisely the behavior we care about when studying catastrophic loss
+years. Lower values of $\nu$ produce heavier joint tails, with the
+Gaussian Copula recovered as a special case when
+$\nu \rightarrow \infty$. With three inputs to replace, we can still
+capture the entire dependence structure with a $3 \times 3$
+correlation matrix whose estimates are defensible by physical science
+literature, now augmented by a single additional parameter $\nu$ that
+we explore through sensitivity analysis.
+
+### Shape of distribution for each hazard
+
+**Tornado Annualized Frequency:** We chose the Poisson distribution
+for this hazard because the occurrence are discrete counts of whole
+number and last year's chance of experiencing a tornado does not
+change the next years. The Poisson Distribution is also the natural
+model for data like this because it is designed to model the number of
+times a random, rare event occurs within a specific interval of time.
+The Poisson Distribution is governed by a single parameter $\lambda$,
+which is the average number of events per year. There is only one
+parameter to estimate, making this straightforward even with sparse
+historical data. We will also check whether the zero-inflated
+variation fits the historical data better because of the excess amount
+of 0s.
+
+**Flood Historical Loss Ratio:** We used a two-part hurdle model
+because the flood loss in Manhattan is 0 in most years, then
+occasionally very large. Given the nature of the variable, we wish to
+seperate the if, and the how much, so there's two parts to the
+distribution 1. Did a flood happen this year? 2. Given that a loss was
+recorded, how severe is it? We fit a lognormal distribution to these
+positive loss years.
+
+**Earthquake Historical Loss Ratio:** Similarly, we used two-part
+structure as the above. But because in our period of record, there was
+no recorded earthquakes, so we cannot fit a distribution to zero
+observations. Instead, we set the parameters based on published
+structural engineering studies: the USGS seismic hazard maps, FEMA's
+HAZUS earthquake loss tables, and Tantala et al. (2003), who estimated
+earthquake losses for the NYC metro area.
+
+## Part 2: Estimating parameters for Tornado Annual Frequency
+
+### Data Source and Marginal Model
+
+Annual tornado event counts for New York County (FIPS 36061) are drawn
+from SHELDUS v19 (Hazard = "Tornado"), which itself sources from the
+NOAA Storm Events Database. The period of record is 1960–2022 (63
+years): <https://www.ncdc.noaa.gov/stormevents/>
+<https://cemhs.asu.edu/sheldus>
+
+**Marginal Model** Poisson distribution, if $\lambda_T = 0.1$, that
+means on average one tornado per decade. The distribution tells us
+exactly how likely 0, 1, 2, 3, ... tornadoes are in any given year,
+all from that single parameter. Formally:
+$N_T \sim \text{Poisson}(\lambda_T)$.
+
+### Annual Count
+
+SHELDUS records only event years, so years with zero tornadoes are
+absent from the dataset. We can reconstruct the full annual count
+series by joining onto a complete year and filling absences with zero.
+
+```{r}
+#| label: tornado-series
+
+por_start_trnd <- 1960
+por_end_trnd   <- 2022
+por_years_trnd <- por_end_trnd - por_start_trnd + 1
+
+tornado_events <- sheldus_county_clean %>%
+  filter(Hazard == "Tornado") %>%
+  group_by(Year) %>%
+  summarise(n_events = n(), .groups = "drop")
+
+annual_tornado <- tibble(Year = por_start_trnd:por_end_trnd) %>%
+  left_join(tornado_events, by = "Year") %>%
+  mutate(n_events = replace_na(n_events, 0L))
+
+tibble(
+  Statistic = c("Period of record", "Total years", "Observed events",
+                "Years with ≥ 1 event", "Years with zero events"),
+  Value     = c(paste(por_start_trnd, "–", por_end_trnd),
+                por_years_trnd,
+                sum(annual_tornado$n_events),
+                sum(annual_tornado$n_events > 0),
+                sum(annual_tornado$n_events == 0))
+) %>%
+  kable(caption = "Tornado annual count series — summary statistics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Exploratory Analysis - Tornado Data
+
+```{r}
+#| label: tornado-explore
+
+# When did tornadoes actually occur?
+annual_tornado %>%
+  filter(n_events > 0) %>%
+  print()
+
+# Frequency table of annual counts
+print(table(annual_tornado$n_events))
+
+# Timeline plot
+ggplot(annual_tornado, aes(x = Year, y = n_events)) +
+  geom_col(fill = "steelblue", width = 0.8) +
+  labs(
+    title    = "Annual Tornado Count — Manhattan 1960–2022",
+    subtitle = "Only 3 tornado events recorded across 63 years",
+    x = "Year", y = "Number of tornado events"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Sample mean and sample variance 
+cat("Mean:             ", round(mean(annual_tornado$n_events), 4), "\n")
+cat("Variance:         ", round(var(annual_tornado$n_events),  4), "\n")
+cat("Ratio (var/mean): ", round(var(annual_tornado$n_events) /
+                                  mean(annual_tornado$n_events), 4), "\n")
+```
+
+### MLE for Poisson ($\lambda_T$)
+
+Through the Maximum Likelihood Estimation (MLE) method, we want to
+answer the question of, what value of the parameter makes the data
+actually observed as probable as possible? For the Poisson
+distribution, we seek to maximize the log-likelihood function: $$
+\ell(\lambda) = \sum_{t=1}^{T} \left[ x_t \log\lambda - \lambda - \log(x_t!) \right]
+$$
+
+**Source:** Taboga, Marco (2021). "Poisson distribution - Maximum
+Likelihood Estimation", Lectures on probability theory and
+mathematical statistics. Kindle Direct Publishing. Online appendix.
+https://www.statlect.com/fundamentals-of-statistics/Poisson-distribution-maximum-likelihood.
+
+Setting its derivative to 0 gives us $\hat{\lambda} = \bar{x}$, which
+means the estimator $\hat{\lambda}$ is just the sample mean (proof
+given in the above source). And the standard error tells us how far,
+on average, a sample mean is likely to differ from the true population
+mean. $$
+\hat{\lambda} = \bar{x}, \qquad \text{SE}(\hat{\lambda}) = \sqrt{\hat{\lambda}/T}
+$$
+
+```{r}
+#| label: tornado-mle
+
+# Estimating parameter lambda hat
+lambda_hat <- mean(annual_tornado$n_events)
+
+# Standard error of lambda hat
+lambda_se  <- sqrt(lambda_hat / por_years_trnd)
+
+# Confidence Interval - because for large samples like ours, the MLE lambda hat is asymptotically normally distributed (proof in source above). So +- 1.96 is used to calculate the 95% confidence interval
+lambda_ci  <- lambda_hat + c(-1.96, 1.96) * lambda_se
+
+tibble(
+  Parameter        = c("λ̂ (annual rate)", "SE(λ̂)", "95% CI lower",
+                        "95% CI upper", "Mean return period (years)"),
+  Value            = round(c(lambda_hat, lambda_se, lambda_ci[1],
+                              lambda_ci[2], 1 / lambda_hat), 4)
+) %>%
+  kable(caption = "Poisson MLE — tornado annual frequency, Manhattan 1960–2022") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Save estimates for for simulation process
+lambda_T <- lambda_hat 
+```
+
+### Goodness-of-fit
+
+With the parameters estimated, we compare our data observed tornado
+annual frequencies against the Poisson-predicted frequencies. With
+only 3 observed tornado years in our data, a simple visual inspection
+is used.
+
+```{r}
+#| label: tornado-gof
+
+# find the highest number of tornadoes recorded in a single year within your dataset
+max_count <- max(annual_tornado$n_events)
+
+# counts how many years had 0 tornadoes, 1 tornado, etc but only counts positive integers (+1L)
+obs_freq  <- tabulate(annual_tornado$n_events + 1L, nbins = max_count + 1)
+
+# calculates the probability of seeing each tornado count (0, 1, 2...) based on your average rate (lambda hat, assuming a perfect poisson distribution
+exp_freq  <- dpois(0:max_count, lambda_hat) * por_years_trnd
+
+tibble(
+  `Annual count`    = 0:max_count,
+  `Observed years`  = obs_freq,
+  `Expected (Poisson)` = round(exp_freq, 2)
+) %>%
+  kable(caption = "Observed vs. Poisson-expected annual tornado frequencies — Manhattan") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Zero-inflated Poisson Comparison
+
+Since our sample has 60 non-tornado years and 3 tornado years, we
+check to see if the zero-inflated Poisson is a better fit because it
+adds another explanation for zeros (maybe some years are structurally
+tornado-free regardless of the real chance of tornado occurrence
+instead of a non-tornado year where it just happened that no tornado
+occurred).
+
+We compare the two models using Akaike Information Criterion (AIC),
+which estimates the quality of each model relative to the other, given
+a set of data. Let $k$ be the number of parameters needed and
+$\hat{L}$ be the maximized value of the model's likelihood function,
+the AIC value of the model is $$
+AIC = 2k-2ln(\hat{L}).
+$$
+
+**Source:** Wikipedia contributors, "Akaike information criterion,"
+Wikipedia, The Free Encyclopedia,
+https://en.wikipedia.org/w/index.php?title=Akaike_information_criterion&oldid=1319366559
+(accessed April 11, 2026).
+
+This measure rewards a model for its goodness of fit but penalizes it
+for amount of parameter it needs. We choose the model with a lower
+AIC, so if the Zero Inflated Poisson model does not meaningfully
+improve goodness-of-fit despite needing an extra parameter, we will
+use the simpler Poisson model.
+
+```{r}
+#| label: tornado-zip-comparison
+
+# two-part formula separated by the pipe (|) where n_events ~ 1 is the count part (models the number of events across all years in dataset rather than predicting based on other variables). And "| 1" is the Zero-inflation part (Models the probability of being an "excess zero" using only an intercept).
+zip_fit <- pscl::zeroinfl(n_events ~ 1 | 1, data = annual_tornado, dist = "poisson")
+
+# calculate the overall average rate of n_events across all years in the annual_tornado dataset, rather than predicting it based on other variables (arg 1)
+poi_fit <- glm(n_events ~ 1, data = annual_tornado, family = poisson)
+
+tibble(
+  Model  = c("Poisson", "Zero-Inflated Poisson"),
+  AIC    = round(c(AIC(poi_fit), AIC(zip_fit)), 2),
+  `# Parameters` = c(1L, 2L)
+) %>%
+  kable(caption = "Poisson vs. ZIP model comparison — lower AIC is preferred") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+We will proceed with the Poisson because of its lower AIC value.
+
+## Part 3: Estimating Parameters for Annual Flood Loss
+
+```{r}
+#| label: flood-records-manhattan
+
+# Check raw records before any pre-processing
+cat("Raw SHELDUS flood records (Manhattan): \n")
+sheldus_raw %>%
+  filter(County_FIPS == fips_county) %>%
+  filter(Hazard %in% c("Flooding", "Coastal")) %>%
+  select(Year, Month, Hazard, prop_dmg_adj, crop_dmg_adj,
+         Fatalities, Injuries, Duration_Days) %>%
+  print(n = 50)
+
+# Check cleaned/aggregated records
+cat("Cleaned SHELDUS flood records (Manhattan): \n")
+sheldus_county_clean %>%
+  filter(Hazard %in% c("Flooding", "Coastal")) %>%
+  mutate(has_loss = prop_dmg_adj > 0) %>%
+  select(Year, Month, Hazard, prop_dmg_adj, has_loss) %>%
+  print(n = 50)
+
+# Summary breakdown
+cat("Breakdown: occurrence vs. damage: \n")
+sheldus_county_clean %>%
+  filter(Hazard %in% c("Flooding", "Coastal")) %>%
+  mutate(has_loss = prop_dmg_adj > 0) %>%
+  count(has_loss) %>%
+  print()
+
+# Annual aggregation
+cat("Annual flood records: \n")
+sheldus_county_clean %>%
+  filter(Hazard %in% c("Flooding", "Coastal")) %>%
+  group_by(Year) %>%
+  summarise(n_records  = n(),
+            total_loss = sum(prop_dmg_adj, na.rm = TRUE),
+            .groups    = "drop") %>%
+  arrange(desc(n_records)) %>%
+  print(n = 50)
+
+flood_events <- sheldus_county_clean %>%
+  filter(Hazard %in% c("Flooding", "Coastal")) %>%
+  group_by(Year) %>%
+  summarise(n_records  = n(),
+            total_loss = sum(prop_dmg_adj, na.rm = TRUE),
+            .groups    = "drop")
+
+annual_flood_spine <- tibble(Year = por_start_trnd:por_end_trnd) %>%
+  left_join(flood_events, by = "Year") %>%
+  mutate(n_records  = replace_na(n_records,  0L),
+         total_loss = replace_na(total_loss, 0))
+
+cat("Total years in period:              ", por_years_trnd, "\n")
+cat("Years with any flood record:        ",
+    sum(annual_flood_spine$n_records > 0), "\n")
+cat("Years with flood damage > $0:       ",
+    sum(annual_flood_spine$total_loss > 0), "\n")
+cat("Years with zero records:            ",
+    sum(annual_flood_spine$n_records == 0), "\n")
+
+# Show only the years where something happened
+cat("Years with at least one flood record: \n")
+annual_flood_spine %>%
+  filter(n_records > 0) %>%
+  mutate(total_loss = dollar(round(total_loss))) %>%
+  print(n = 50)
+```
+
+### Data Source and Marginal Model
+
+Annual flood losses for New York County (FIPS 36061) are drawn from
+SHELDUS v19. <https://cemhs.asu.edu/sheldus>
+
+**Marginal Model** Two-part hurdle model with lognormal distribution.
+Loss data is fundamentally different from a loss data because losses
+are only to be incurred if the hazard was present to begin with. So a
+two part hurdle model combines a binary model to model whether or not
+flooding happened and a lognormal model to see how severe the damage
+was, given there was a flooding event.
+
+Formally, let $L_F$ be the annual loss from flood events, then our
+data is seperated into years with no loss means $L_F=0$ and years with
+loss $L_F>0$. Consider when $L_F=0$, let $p_f=P(L_F>0)$ be the
+probability that any flood damages occur in a given year. Consider
+when $L_F>0$, we fit their distribution to a lognormal distribution
+with parameters $\mu_F$ (mean of underlying distribution) and
+$\sigma_F$ (standard deviation of distribution). We chose a lognormal
+distribution because flood damages tend to grow multiplicatively where
+a moderate flood might cause 10x the damage as a mild one, and a major
+flood might cause 10x the damage of a moderate one and so on. Thus, it
+is likely that the log transformed loss of flood damage is normally
+distributed. Combining the two gives us $$
+L_F = \begin{cases} 0 & \text{with probability } 1 - p_F \\ \text{Lognormal}~(\mu_F, \sigma^2_F) & \text{with probability } p_F \end{cases}
+$$
+
+**Source:**
+
+1.  Cragg, J. G., "Some Statistical Models for Limited Dependent
+    Variables with Application to the Demand for Durable Goods,"
+    Econometrica, vol. 39, no. 5, pp. 829–844, 1971.
+    https://doi.org/10.2307/1909582
+
+2.  Wooldridge, J. M., "Hurdle and Selection Models," BGSE/IZA Course
+    in Microeconometrics Lecture Notes, Michigan State
+    University, 2009.
+    https://legacy.iza.org/teaching/wooldridge-course-09/course_html/docs/slides_twopart_5_r1.pdf
+    (accessed April 11, 2026).
+
+3.  Hsu, A.-C. and Liu, S.-C., "The hurdle models choice between
+    truncated normal and lognormal," Applied Economics, vol. 40, no.
+    2, pp. 201–207, 2008. https://doi.org/10.1080/00036840600749581
+
+### Annual Loss
+
+```{r}
+#| label: flood-annual-loss
+
+annual_flood <- sheldus_county_clean %>%
+  filter(Hazard %in% c("Flooding", "Coastal")) %>%
+  group_by(Year) %>%
+  summarise(total_loss = sum(prop_dmg_adj, na.rm = TRUE), .groups = "drop")
+
+annual_flood_full <- tibble(Year = por_start_trnd:por_end_trnd) %>%
+  left_join(annual_flood, by = "Year") %>%
+  mutate(total_loss = replace_na(total_loss, 0))
+
+flood_loss_years   <- annual_flood_full %>% filter(total_loss > 0)
+n_flood_loss_years <- nrow(flood_loss_years)
+
+tibble(
+  Statistic = c("Period of record", "Years with positive loss",
+                "Years with zero loss", "Maximum single-year loss"),
+  Value     = c(paste(por_start_trnd, "–", por_end_trnd),
+                n_flood_loss_years,
+                por_years_trnd - n_flood_loss_years,
+                dollar(round(max(annual_flood_full$total_loss))))
+) %>%
+  kable(caption = "Annual flood loss series — summary statistics, Manhattan") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Explanatory Analysis - Flood Data
+
+```{r}
+#| label: flood-explore
+#| fig-height: 5
+
+# Timeline of annual flood losses
+ggplot(annual_flood_full, aes(x = Year, y = total_loss / 1e6)) +
+  geom_col(fill = "steelblue", width = 0.8) +
+  labs(
+    title    = "Annual Flood Building Loss — Manhattan 1960–2022",
+    subtitle = "Zero in most years; sporadic moderate losses when events occur",
+    x = "Year", y = "Loss ($M, 2022 adj.)"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Raw vs. log-transformed positive losses side by side
+if (n_flood_loss_years >= 3) {
+  p_raw <- ggplot(flood_loss_years, aes(x = total_loss / 1e6)) +
+    geom_histogram(bins = 12, fill = "steelblue",
+                   color = "white", alpha = 0.8) +
+    labs(title = "Raw losses ($M)", x = "Loss ($M)", y = "Count") +
+    theme_minimal(base_size = 11)
+
+  p_log <- ggplot(flood_loss_years, aes(x = log(total_loss))) +
+    geom_histogram(bins = 12, fill = "coral",
+                   color = "white", alpha = 0.8) +
+    labs(title = "Log(losses)",
+         x = "log(Loss)", y = "Count") +
+    theme_minimal(base_size = 11)
+
+  print(p_raw + p_log +
+    plot_annotation(
+      title    = "Flood severity: raw vs. log-transformed positive-loss years",
+      subtitle = paste0(n_flood_loss_years, " positive-loss years out of ",
+                        por_years_trnd, " total")
+    ))
+
+  # Summary of positive-loss years
+  cat("Positive-loss years: summary")
+  print(summary(flood_loss_years$total_loss))
+  cat("Empirical p_F:", round(p_F_hat <- n_flood_loss_years / por_years_trnd, 3), "\n")
+}
+```
+
+### Part (a) Bernoulli MLE
+
+To estimate $p_F$, notice the maximum likelihood estimate for a
+Bernoulli distribution is the sample mean, given $T$ independent draws
+$$
+\hat{p}_F = \frac{\text{# years with loss} > 0}{T};
+$$ 
+$$
+
+\text{SE}(\hat{p}_F) = \sqrt{\frac{\hat{p}_F(1-\hat{p}_F)}{T}}.
+$$
+
+**Sources:**
+
+1.  Casella, G. and Berger, R. L., Statistical Inference, 2nd ed.,
+    Duxbury Press, Pacific Grove, CA, 2002, pp. 315–320 (MLE), pp.
+    347–349.
+2.  Wasserman, L., All of Statistics: A Concise Course in Statistical
+    Inference, Springer, New York, 2004, pp. 119–121.
+    https://doi.org/10.1007/978-0-387-21736-9
+3.  Wikipedia contributors, "Bernoulli distribution," Wikipedia, The
+    Free Encyclopedia,
+    https://en.wikipedia.org/wiki/Bernoulli_distribution (accessed
+    April 11, 2026).
+
+```{r}
+#| label: flood-bernoulli
+
+p_F_hat <- n_flood_loss_years / por_years_trnd
+p_F_se  <- sqrt(p_F_hat * (1 - p_F_hat) / por_years_trnd)
+
+tibble(
+  Parameter = c("p̂_F (prob. positive-loss year)", "SE(p̂_F)",
+                 "95% CI lower", "95% CI upper"),
+  Value     = round(c(p_F_hat, p_F_se,
+                       p_F_hat - 1.96 * p_F_se,
+                       p_F_hat + 1.96 * p_F_se), 4)
+) %>%
+  kable(caption = "Bernoulli MLE — flood occurrence probability, Manhattan") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Part (b) Lognormal MLE for Severity
+
+For years where flood loss occurred, we fit the loss severity to a
+lognormal distribution by estimating two parameters, $\mu_F$ (the mean
+of logged losses) and $\sigma_F$ (the spread of logged losses).
+
+```{r}
+#| label: flood-lognormal
+
+  flood_fit <- fitdistrplus::fitdist(flood_loss_years$total_loss,
+                                     distr = "lnorm", method = "mle")
+  mu_F    <- flood_fit$estimate["meanlog"]
+  sigma_F <- flood_fit$estimate["sdlog"]
+
+tibble(
+  Parameter = c("μ̂_F (meanlog)", "σ̂_F (sdlog)",
+                 "Implied median ($)", "Implied mean ($)",
+                 "Implied 95th percentile ($)", "Implied 99th percentile ($)"),
+  Value     = c(round(mu_F, 4),
+                round(sigma_F, 4),
+                dollar(round(exp(mu_F))),
+                dollar(round(exp(mu_F + 0.5 * sigma_F^2))),
+                dollar(round(qlnorm(0.95, mu_F, sigma_F))),
+                dollar(round(qlnorm(0.99, mu_F, sigma_F))))
+) %>%
+  kable(caption = "Lognormal MLE — flood severity conditional on loss > 0 for Manhattan") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Goodness-of-fit
+
+We check how well a lognormal distribution fits our loss data through
+the Anderson-Darling test for normality. We chose this test over
+various other normality tests because tail behavior is the main focus
+of our work, and A-D test places more weight on tail departures,
+making it the best for detecting outliers and heavy-tails.
+
+The null hypothesis being tested is:
+$H_0: \log(L_F) \sim N(\mu, \sigma^2)$.
+
+```{r}
+#| label: flood-ad-test
+  log_losses <- log(flood_loss_years$total_loss)
+  ad_result  <- nortest::ad.test(log_losses)
+
+  tibble(
+    Test      = "Anderson-Darling",
+    Statistic = round(ad_result$statistic, 4),
+    `p-value` = round(ad_result$p.value,   4),
+    Conclusion = ifelse(ad_result$p.value > 0.05,
+                        "Fail to reject H₀ — Lognormal adequate",
+                        "Reject H₀ — consider GPD alternative")
+  ) %>%
+    kable(caption = "Anderson-Darling GOF test — log(annual flood loss), Manhattan") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+We also plot a Quantile-Quantile (QQ) plot to assess if our data
+follows our proposed lognormal distribution by plotting the quantiles
+of sample data against lognormal quantiles. The points fall along a
+straight 45-degree line, meaning the distributions are in fact
+similar.
+
+```{r}
+  #|label: Q-Q plot
+  qqnorm(log_losses,
+         main = "Q-Q Plot: log(Annual Flood Loss) — Manhattan",
+         pch  = 19, col = "steelblue", cex = 0.85)
+  qqline(log_losses, col = "firebrick", lwd = 1.5)
+```
+
+### Complete Fitted Distribution
+
+The first graph shows the Bernoulli split (what fraction of years have
+any loss). The second shows the Lognormal density for the severity
+conditional on a loss occurring.
+
+```{r}
+#| label: flood-dist-plots
+#| fig-height: 8
+
+# Part A: Bernoulli bar chart
+p_bern <- tibble(
+  outcome = c("No loss (0)", "Loss occurs"),
+  prob    = c(1 - p_F_hat, p_F_hat)
+) %>%
+  ggplot(aes(x = outcome, y = prob, fill = outcome)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = percent(prob, accuracy = 0.1)),
+            vjust = -0.4, size = 4) +
+  scale_fill_manual(values = c("No loss (0)"  = "grey70",
+                               "Loss occurs"  = "steelblue")) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title    = "Flood Part 1 — Bernoulli occurrence model",
+    subtitle = paste0("p̂_F = ", round(p_F_hat, 3),
+                      ": ~", round(p_F_hat*100), "% of years have any flood loss"),
+    x = NULL, y = "Probability"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Part B: Lognormal severity curve
+x_fl   <- exp(seq(log(1e4), log(2e9), length.out = 600))
+dens_fl <- dlnorm(x_fl, meanlog = mu_F, sdlog = sigma_F)
+
+p_ln <- ggplot(data.frame(x = x_fl / 1e6, y = dens_fl), aes(x, y)) +
+  geom_line(color = "steelblue", linewidth = 1.1) +
+  geom_vline(xintercept = exp(mu_F) / 1e6,
+             linetype = "dashed", color = "firebrick", linewidth = 0.9) +
+  geom_vline(xintercept = exp(mu_F + 0.5 * sigma_F^2) / 1e6,
+             linetype = "dotted", color = "darkgreen", linewidth = 0.9) +
+  annotate("text",
+           x = exp(mu_F) / 1e6 * 1.15,
+           y = max(dens_fl) * 0.75,
+           label = paste0("Median\n$", round(exp(mu_F) / 1e3), "K"),
+           color = "firebrick", hjust = 0, size = 3.2) +
+  annotate("text",
+           x = exp(mu_F + 0.5 * sigma_F^2) / 1e6 * 1.15,
+           y = max(dens_fl) * 0.45,
+           label = paste0("Mean\n$", round(exp(mu_F + 0.5*sigma_F^2) / 1e6, 1), "M"),
+           color = "darkgreen", hjust = 0, size = 3.2) +
+  scale_x_log10(labels = dollar_format(suffix = "M")) +
+  labs(
+    title    = "Flood Part 2 — Lognormal severity (conditional on loss > 0)",
+    subtitle = paste0("μ̂ = ", round(mu_F, 2), ", σ̂ = ", round(sigma_F, 2),
+                      " | mean far above median = fat right tail"),
+    x = "Annual flood loss (log scale, $M)", y = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_bern / p_ln)
+```
+
+## Part 4: Estimating Parameters for Earthquake Building Loss
+
+### Data Source and Marginal Model
+
+```{r}
+#|labels: Earthquake-records-manhattan 
+
+# Check raw records before any pre-processing
+cat("Raw SHELDUS earthquake records (Manhattan): \n")
+sheldus_raw %>%
+  filter(County_FIPS == fips_county) %>%
+  filter(grepl("earthquake|quake", Hazard, ignore.case = TRUE)) %>%
+  select(Year, Month, Hazard, prop_dmg_adj, crop_dmg_adj,
+         Fatalities, Injuries, Duration_Days) %>%
+  print(n = 50)
+
+# Check cleaned/aggregated records
+cat("Cleaned SHELDUS earthquake records (Manhattan): \n")
+sheldus_county_clean %>%
+  filter(grepl("earthquake|quake", Hazard, ignore.case = TRUE)) %>%
+  mutate(has_loss = prop_dmg_adj > 0) %>%
+  select(Year, Month, Hazard, prop_dmg_adj, has_loss) %>%
+  print(n = 50)
+
+# Summary breakdown 
+cat("Breakdown: occurrence vs. damage: \n")
+sheldus_county_clean %>%
+  filter(grepl("earthquake|quake", Hazard, ignore.case = TRUE)) %>%
+  mutate(has_loss = prop_dmg_adj > 0) %>%
+  count(has_loss) %>%
+  print()
+
+# Annual aggregation 
+cat("Annual earthquake records: \n")
+sheldus_county_clean %>%
+  filter(grepl("earthquake|quake", Hazard, ignore.case = TRUE)) %>%
+  group_by(Year) %>%
+  summarise(n_records  = n(),
+            total_loss = sum(prop_dmg_adj, na.rm = TRUE),
+            .groups    = "drop") %>%
+  arrange(desc(n_records)) %>%
+  print(n = 50)
+
+eq_events <- sheldus_county_clean %>%
+  filter(grepl("earthquake|quake", Hazard, ignore.case = TRUE)) %>%
+  group_by(Year) %>%
+  summarise(n_records  = n(),
+            total_loss = sum(prop_dmg_adj, na.rm = TRUE),
+            .groups    = "drop")
+
+annual_eq_full <- tibble(Year = por_start_trnd:por_end_trnd) %>%
+  left_join(eq_events, by = "Year") %>%
+  mutate(n_records  = replace_na(n_records,  0L),
+         total_loss = replace_na(total_loss, 0))
+
+cat("Total years in period:", por_years_trnd, "\n")
+cat("Years with any earthquake record:   ",
+    sum(annual_eq_full$n_records > 0), "\n")
+cat("Years with earthquake damage > $0:  ",
+    sum(annual_eq_full$total_loss > 0), "\n")
+cat("Years with zero records:            ",
+    sum(annual_eq_full$n_records == 0), "\n")
+
+
+# Show only the years where something happened
+cat("Years with at least one earthquake record: \n")
+annual_eq_full %>%
+  filter(n_records > 0) %>%
+  mutate(total_loss = dollar(round(total_loss))) %>%
+  print(n = 50)
+```
+
+Manhattan has not experienced earthquake damage in our 63 years of
+record, so we will not be able to estimate occurrence (and hence loss)
+probability from no observed data. So we use the standard solution of
+using external evidence like published engineering studies to set
+parameters for our distribution.
+
+**Marginal model:** For the same reasons outlined above, we will use
+the same two-part hurdle structure as annual flood loss because we ask
+the same two questions, did a damaging earthquake occur this year? If
+so, how much was lost? We use published resources to get the
+appropriate parameter rather than fitting the distribution to our
+SHELDUS data:
+
+1.  **USGS National Seismic Hazard Maps (2023).** NYC 2% probability
+    of exceedance in 50 years implies a 2,475-year return period Peak
+    Ground Accleration (PGA) of 0.20–0.25g (in any given year, there's
+    a 1 in 2475 chance of esceeding this shake level). This means
+    20%-25% of the accleration of gravity, which is strong but
+    generally not destructive to well-engineered modern structures. We
+    use this to anchor the tail behavior of $L_E$.
+    <https://www.usgs.gov/programs/earthquake-hazards/hazard-maps>
+2.  **FEMA HAZUS-MH Technical Manual — Earthquake Module (FEMA,
+    2020).** Annualized building loss estimates for NYC building under
+    USGS hazard maps imply $\approx \$50$–$200$M citywide; Manhattan's
+    share is roughly 20–30%.
+    <https://www.fema.gov/flood-maps/tools-resources/hazus>
+3.  **Tantala, M.W., Gustafson, J.L., Deodatis, G., & Jacob, K.
+    (2003).** "Earthquake Loss Estimation for the New York City
+    Metropolitan Area." *Earthquake Spectra*, 19(1), 45–70. For a
+    $M_w5.0$ event (≈500-year return period), citywide direct building
+    loss ≈ \$3–6B; Manhattan's≈30% share implies a \$1.0–1.8B
+    conditional loss for a severe event.
+
+### Calibrate parameter values
+
+We calibrate parameter values using these literatures.
+
+```{r}
+#| label: earthquake-params
+
+# Event probability: USGS NSHM and HAZUS annualized loss tables (FEMA, 2020)
+# A "damaging event" causing measurable Manhattan building loss occurs with
+# probability ~0.001–0.003/year, we chose to use the midpoint.
+p_E <- 0.002
+
+# Conditional severity: LogNormal(μ_E, σ_E²)
+# Calibration: qlnorm(1 - 1/500, μ_E, σ_E) ≈ $1.0–1.5B (Manhattan's ~30% share of Tantala et al.'s Mw 5.0 citywide estimate)
+# μ_E = 20.5 → median ≈ exp(20.5) ≈ $800M
+# σ_E = 1.0  → sufficient right tail to reach multi-billion in extreme draws
+mu_E    <- 20.5
+sigma_E <- 1.0
+
+# verification for calibration
+tibble(
+  Parameter   = c("p_E (annual prob. of damaging event)",
+                   "μ_E (meanlog of conditional severity)",
+                   "σ_E (sdlog of conditional severity)",
+                   "Implied median loss ($)",
+                   "Implied 95th percentile ($)",
+                   "Implied 99th percentile ($)",
+                   "Implied 99.9th percentile ($)"),
+  Value       = c(p_E, mu_E, sigma_E,
+                   dollar(round(exp(mu_E))),
+                   dollar(round(qlnorm(0.95,  mu_E, sigma_E))),
+                   dollar(round(qlnorm(0.99,  mu_E, sigma_E))),
+                   dollar(round(qlnorm(0.999, mu_E, sigma_E)))),
+  Source      = c("USGS NSHM 2023 + FEMA HAZUS-MH (2020)",
+                   "Calibrated to Tantala et al. (2003)",
+                   "Tantala et al. (2003); HAZUS-MH sensitivity range",
+                   "—", "—", "—", "—")
+) %>%
+  kable(caption = "Earthquake parameters — literature-derived priors, Manhattan") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Distribution Plot
+
+Since there are no observed losses to explore and compare our fitted
+distribution to, we show what the literature-derived severity
+distribution for earthquake building loss looks like to check if the
+parameters produce reasonable impied losses.
+
+```{r}
+#| label: earthquake-explore
+#| fig-height: 7
+
+# Part A: Bernoulli — how rare is a damaging event?
+p3a <- tibble(
+  outcome = c("No damage (0)", "Damaging event"),
+  prob    = c(1 - p_E, p_E)
+) %>%
+  ggplot(aes(x = outcome, y = prob, fill = outcome)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = percent(prob, accuracy = 0.001)),
+            vjust = -0.4, size = 4) +
+  scale_fill_manual(values = c("No damage (0)"  = "grey70",
+                               "Damaging event" = "firebrick")) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title    = "Earthquake Part 1 — Bernoulli occurrence",
+    subtitle = paste0("p_E = ", p_E,
+                      ": damaging event roughly once every 500 years"),
+    x = NULL, y = "Probability"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Part B: Lognormal severity, if there is a earthquake
+x_eq   <- exp(seq(log(1e8), log(5e10), length.out = 600))
+dens_eq <- dlnorm(x_eq, meanlog = mu_E, sdlog = sigma_E)
+
+p3b <- ggplot(data.frame(x = x_eq / 1e9, y = dens_eq), aes(x, y)) +
+  geom_line(color = "firebrick", linewidth = 1.1) +
+  geom_vline(xintercept = exp(mu_E) / 1e9,
+             linetype = "dashed", color = "firebrick", linewidth = 0.9) +
+  annotate("text",
+           x = exp(mu_E) / 1e9 * 1.08,
+           y = max(dens_eq) * 0.8,
+           label = paste0("Median\n$", round(exp(mu_E) / 1e9, 1), "B"),
+           color = "firebrick", hjust = 0, size = 3.5) +
+  scale_x_log10(labels = dollar_format(suffix = "B")) +
+  labs(
+    title    = "Earthquake Part 2 — Lognormal severity (conditional on event)",
+    subtitle = paste0("μ_E = ", mu_E, ", σ_E = ", sigma_E,
+                      " | literature prior from Tantala et al. (2003)"),
+    x = "Conditional building loss ($B, log scale)", y = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Percentile table for quick sanity check
+cat("Earthquake severity percentile table")
+tibble(
+  Percentile = c("50th (median)", "90th", "95th", "99th", "99.9th"),
+  `Conditional loss` = dollar(round(
+    qlnorm(c(0.50, 0.90, 0.95, 0.99, 0.999), mu_E, sigma_E)
+  ))
+) %>% print()
+
+print(p3a / p3b)
+```
+
+## Part 5: Specify t-Copula
+
+We pick the t-Copula because it outperforms the Gaussian in modeling
+extreme joint risks due to its heavier tail dependence. The main input
+we need for the t-Copula is the $3\times 3$ matrix, $\mathbf{P}$ of
+pairwise correlation between the occurrence of three hazards.
+
+|            | Tornado | Flood | Earthquake |
+|------------|---------|-------|------------|
+| Tornado    | 1.00    | 0.05  | 0.00       |
+| Flood      | 0.05    | 1.00  | 0.00       |
+| Earthquake | 0.00    | 0.00  | 1.00       |
+
+We also need the degree of freedom as the other input, in this case,
+we picked 4 due to our hypothesized heavy tail dependence.
+**Justification:**
+
+1.  $\rho(\text{Tornado}, \text{Flood}) = 0.05$ (weak positive
+    correlation): The empirical Spearman correlation (assess when
+    tornado count is higher, does flood loss tend to be higher too?)
+    between annual tornado count and annual flood building kiss un
+    Manhattan in our period of record is about 0.035. We choose to set
+    $\rho_{TF}=0.05$, which overstates the observed dependence from
+    our data to acknowledge the theoretical shared convective driver
+    of each hazards.
+
+```{r}
+corr_check <- tibble(Year = por_start_trnd:por_end_trnd) %>%
+  left_join(
+    annual_tornado %>% select(Year, n_tornado = n_events),
+    by = "Year"
+  ) %>%
+  left_join(
+    annual_flood_full %>% select(Year, flood_loss = total_loss),
+    by = "Year"
+  ) %>%
+  mutate(
+    n_tornado  = replace_na(n_tornado,  0),
+    flood_loss = replace_na(flood_loss, 0)
+  )
+
+# Spearman rank correlation
+cat("Spearman correlation (tornado count vs. flood loss):")
+cat(round(cor(corr_check$n_tornado, corr_check$flood_loss,
+              method = "spearman"), 4), "\n")
+```
+
+2.  $\rho(\text{Tornado}, \text{Earthquake}) = 0.00$ and
+    $\rho(\text{Flood}, \text{Earthquake}) = 0.00$ because Earthquakes
+    are caused by tectonic stress in the earth's crust, which has
+    nothing to do with weather. There is no physical reason for a bad
+    earthquake year would coincide with a bad tornado or flood year.
+
+### Validate correlation matrix
+
+Recall that for a correlation matrix to be mathematically valid, it
+has to be positive definite. We run a quick check to make sure
+
+```{r}
+#| label: corr-matrix
+
+rho_TF <- 0.05
+rho_TE <- 0.00
+rho_FE <- 0.00
+
+P <- matrix(c(1,      rho_TF, rho_TE,
+              rho_TF, 1,      rho_FE,
+              rho_TE, rho_FE, 1),
+            nrow = 3, byrow = TRUE,
+            dimnames = list(c("Tornado", "Flood", "Earthquake"),
+                            c("Tornado", "Flood", "Earthquake")))
+
+eigenvalues <- eigen(P, symmetric = TRUE)$values
+pd_check    <- all(eigenvalues > 0)
+
+if (!pd_check) {
+  P <- as.matrix(Matrix::nearPD(P, corr = TRUE)$mat)
+  message(" matrix was not positive definite")
+}
+
+cat("t-copula correlation matrix P"); print(round(P, 4))
+cat("Eigenvalues of P (all must be > 0")
+print(round(eigenvalues, 6))
+cat("Positive definite:", pd_check)
+```
+
+## Part 6: Monte Carlo Simulation
+
+### Setup
+
+We simulate $N=100,000$ hypothetical annual loss years because we want
+sufficient samples to ensure we capture the tail behavior of the
+simulated risk distribution.
+
+```{r}
+#| label: sim-setup
+
+# initialize a pseudorandom number generator
+set.seed(42)
+N_sim <- 100000L
+nu <- 4  # degrees of freedom for t-copula
+
+cat("Simulation size:", scales::comma(N_sim), "annual loss years")
+```
+
+### Step 1: Draw Copula Sample
+
+We first draw from a tri-variate normal distribution with correlation
+$\mathbf{P}$ (using the Cholesky factorization of $\mathbf{P}$), then
+apply the normal CDF to squish each column into the $[0,1]$ range. The
+result $\mathbf{U}$ is our copula sample — 100,000 rows of three
+correlated uniform values, one column per hazard.
+
+```{r}
+#| label: sim-copula-draw
+
+
+
+
+# Using the Cholesky factor L (3x3), we transform Z to incorporate the correlation we specified in P (L is used as a transformation).
+# W is still a 100,000x3 matrix but columns are now correlated according to our P. Row 1 of W is 1 simulated year of three correlated normal values (1 per hazard)
+W <- rmvt(N_sim, sigma = P, df = nu)  
+
+# check the actual sample correlation matrix of W to compare it with our specified P
+W_cor <- cor(W)
+
+cat("Sample correlation matrix of W")
+print(round(W_cor, 4))
+cat("Max absolute deviation from target P:", round(max(abs(W_cor - P)), 5), "\n")
+
+
+# Now that we have a matrix of correlated normals, we need them to be uniform because the copula is defined on $[0,1]^3$ by the Skylar's theorem. So we apply the normal CDF to mak any real number to a probability distribution from 0 to 1
+U <- pt(W, df = nu)
+```
+
+As a check, we should see each column of $\mathbf{U}$ should have mean
+of around 0.5 and standard deviation of 0.289 (which are mean and SD
+of a uniform \[0,1\]) to check for marginal uniformity
+
+```{r}
+tibble(
+  Column = c("Tornado (col 1)", "Flood (col 2)", "Earthquake (col 3)"),
+  Mean   = round(colMeans(U), 5),
+  SD     = round(apply(U, 2, sd), 5),
+  `Min`  = round(apply(U, 2, min), 5),
+  `Max`  = round(apply(U, 2, max), 5)
+) %>%
+  kable(caption = "Copula sample U — marginal uniformity check") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### Step 2: Convert uniform value into actual loss
+
+Now with $U$ being a uniform random number between 0 and 1,if we feed
+it into the inverse CDF of any distribution, we should get random
+draws of the distribution. For example, if $U=0.95$, we will get the
+95th percentile of the loss distribution we feed it into.
+
+```{r}
+# Tornado
+sim_tornado <- qpois(U[, 1], lambda = lambda_T)
+
+# Flood
+flood_occur <- as.integer(U[, 2] <= p_F_hat)
+flood_sev <- qlnorm(runif(N_sim), mu_F, sigma_F) ##Severity drawn independently to make sure when we get sim_eq, it is not limited to the lower end
+sim_flood <- flood_occur * flood_sev
+
+# Earthquake
+eq_occur <- as.integer(U[, 3] <= p_E)
+eq_sev <- qlnorm(runif(N_sim), mu_E, sigma_E)  ##Severity drawn independently to make sure when we get sim_eq, it is not limited to the lower end
+sim_eq <- eq_occur * eq_sev
+
+# Summary
+bind_rows(
+  # Tornado: count variable
+  tibble(
+    Hazard                    = "Tornado (count)",
+    `Pr(event > 0) simulated` = round(mean(sim_tornado > 0), 4),
+    `Pr(event > 0) target`    = round(1 - dpois(0, lambda_T), 4),
+    `Mean`                    = as.character(round(mean(sim_tornado), 4)),
+    `95th pct`                = as.character(round(quantile(sim_tornado, 0.95))),
+    `99th pct`                = as.character(round(quantile(sim_tornado, 0.99))),
+    `Units`                   = "count"
+  ),
+  # Flood: conditional on loss occurring
+  tibble(
+    Hazard                    = "Flood",
+    `Pr(event > 0) simulated` = round(mean(sim_flood > 0), 4),
+    `Pr(event > 0) target`    = round(p_F_hat, 4),
+    `Mean`                    = dollar(round(mean(sim_flood[sim_flood > 0]))),
+    `95th pct`                = dollar(round(quantile(sim_flood[sim_flood > 0], 0.95))),
+    `99th pct`                = dollar(round(quantile(sim_flood[sim_flood > 0], 0.99))),
+    `Units`                   = "$ (conditional on occurrence)"
+  ),
+  # Earthquake: conditional on loss occurring
+  tibble(
+    Hazard                    = "Earthquake",
+    `Pr(event > 0) simulated` = round(mean(sim_eq > 0), 4),
+    `Pr(event > 0) target`    = p_E,
+    `Mean`                    = dollar(round(mean(sim_eq[sim_eq > 0]))),
+    `95th pct`                = dollar(round(quantile(sim_eq[sim_eq > 0], 0.95))),
+    `99th pct`                = dollar(round(quantile(sim_eq[sim_eq > 0], 0.99))),
+    `Units`                   = "$ (conditional on occurrence)"
+  )
+) %>%
+  kable(caption = "Simulated marginal distributions — summary statistics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**Note:** The above loss statistic for flooding and earthquake is
+reported based on their occurrence because they both follow two-part
+hurdle model. In first part of their model, we know most years
+experience no hazard at all, therefore, no losses. But in the
+remaining years, the loss follow a lognormal severity distribution. So
+we will get a much more meaningful set of numbers based on the
+conditional instead of our summary distribution misleadingly being
+flooded with 0 losses. If we don't do this, the summary statistics
+will look like the following.
+
+```{r}
+#| label: conditional-vs-unconditional
+
+# Unconditional statistics (all 100,000 years including zeros)
+uncond <- bind_rows(
+  tibble(
+    Hazard      = "Flood ($)",
+    Basis       = "Unconditional",
+    `Pr(> 0)`   = round(mean(sim_flood > 0), 4),
+    `Mean`      = dollar(round(mean(sim_flood))),
+    `50th pct`  = dollar(round(quantile(sim_flood, 0.50))),
+    `95th pct`  = dollar(round(quantile(sim_flood, 0.95))),
+    `99th pct`  = dollar(round(quantile(sim_flood, 0.99)))
+  ),
+  tibble(
+    Hazard      = "Earthquake ($)",
+    Basis       = "Unconditional",
+    `Pr(> 0)`   = round(mean(sim_eq > 0), 4),
+    `Mean`      = dollar(round(mean(sim_eq))),
+    `50th pct`  = dollar(round(quantile(sim_eq, 0.50))),
+    `95th pct`  = dollar(round(quantile(sim_eq, 0.95))),
+    `99th pct`  = dollar(round(quantile(sim_eq, 0.99)))
+  )
+)
+
+# Conditional statistics (positive-loss years only)
+cond <- bind_rows(
+  tibble(
+    Hazard      = "Flood ($)",
+    Basis       = "Conditional on occurrence",
+    `Pr(> 0)`   = round(mean(sim_flood > 0), 4),
+    `Mean`      = dollar(round(mean(sim_flood[sim_flood > 0]))),
+    `50th pct`  = dollar(round(quantile(sim_flood[sim_flood > 0], 0.50))),
+    `95th pct`  = dollar(round(quantile(sim_flood[sim_flood > 0], 0.95))),
+    `99th pct`  = dollar(round(quantile(sim_flood[sim_flood > 0], 0.99)))
+  ),
+  tibble(
+    Hazard      = "Earthquake ($)",
+    Basis       = "Conditional on occurrence",
+    `Pr(> 0)`   = round(mean(sim_eq > 0), 4),
+    `Mean`      = dollar(round(mean(sim_eq[sim_eq > 0]))),
+    `50th pct`  = dollar(round(quantile(sim_eq[sim_eq > 0], 0.50))),
+    `95th pct`  = dollar(round(quantile(sim_eq[sim_eq > 0], 0.95))),
+    `99th pct`  = dollar(round(quantile(sim_eq[sim_eq > 0], 0.99)))
+  )
+)
+
+# Combined table
+bind_rows(uncond, cond) %>%
+  arrange(Hazard, Basis) %>%
+  kable(
+    caption = paste0(
+      "Unconditional vs. conditional marginal statistics — ",
+      "N = 100,000 simulated years. Unconditional includes all years ",
+      "regardless of whether a loss occurred. Conditional restricts to ",
+      "years with positive loss only."
+    )
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "middle")
+```
+
+### Aggregate Annual Loss
+
+Having simulated each of the above variables, we use them to construct
+an updated expectual annual loss. Notice each simulated variable
+captures different components of FEMA's
+$\text{EAL} = \text{Exposure} \times AF \times HLR$ formula.
+
+1.  **sim_tornado** - only replaces the AF part for Tornado (measured
+    in count);
+2.  **sim_flood** - The lognormal distribution handles the
+    $HLR\times Exposure$ part for flood hazard for building loss only
+    (measured in dollar amount) and Bernoulli distribution handles the
+    AF part;
+3.  **sim_eq** - same as flood.
+
+Population and agriculture loss components for flood and earthquake,
+as well as the full EAL for all non-simulated hazards, are held at
+their reconstructed point estimates and added as fixed constants to
+every simulated year.
+
+```{r}
+#| label: agg-loss
+
+# Tornado: simulated COUNT × fixed (Exposure × HLR)
+tornado_dmg_data <- sheldus_county_clean %>%
+  filter(Hazard == "Tornado") %>%
+  summarise(mean_dmg  = mean(prop_dmg_adj, na.rm = TRUE),
+            n_records = n())
+
+cat("Tornado records used for mean damage:", tornado_dmg_data$n_records, "\n")
+cat("Fixed mean damage per event (Exposure × HLR per occurrence):",
+    dollar(round(tornado_dmg_data$mean_dmg)), "\n")
+
+mean_dmg_per_tornado <- ifelse(
+  tornado_dmg_data$n_records > 0,
+  tornado_dmg_data$mean_dmg,
+  5e6  # if there is no tornado data, use $5M damage as backup
+)
+
+tornado_loss <- sim_tornado * mean_dmg_per_tornado
+
+# Flood and earthquake: simulated variable already account for all components of the building loss
+
+# Fixed point estimates for all non-simulated components
+## Population and agriculture EAL for the three simulated hazards
+eal_fixed_simulated_hazards <- eal_by_hc %>%
+  filter(nri_prefix %in% c("RFLD", "CFLD", "ERQK"),
+         consequence %in% c("Population", "Agriculture")) %>%
+  summarise(total = sum(EAL_hc, na.rm = TRUE)) %>%
+  pull(total)
+
+# Tornado population and agriculture EAL
+eal_fixed_tornado_nonbldg <- eal_by_hc %>%
+  filter(nri_prefix == "TRND",
+         consequence %in% c("Population", "Agriculture")) %>%
+  summarise(total = sum(EAL_hc, na.rm = TRUE)) %>%
+  pull(total)
+
+# Full EAL (all consequences) for all non-simulated hazards
+eal_fixed_other_hazards <- eal_by_hc %>%
+  filter(!nri_prefix %in% c("RFLD", "CFLD", "ERQK", "TRND")) %>%
+  summarise(total = sum(EAL_hc, na.rm = TRUE)) %>%
+  pull(total)
+
+eal_fixed_total <- eal_fixed_simulated_hazards +
+                   eal_fixed_tornado_nonbldg +
+                   eal_fixed_other_hazards
+
+cat("Fixed point estimate breakdown:")
+cat("  Pop + Agr EAL for RFLD/CFLD/ERQK:  ",
+    dollar(round(eal_fixed_simulated_hazards)), "\n")
+cat("  Tornado pop + agr EAL:             ",
+    dollar(round(eal_fixed_tornado_nonbldg)), "\n")
+cat("  Full EAL for non-simulated hazards:",
+    dollar(round(eal_fixed_other_hazards)), "\n")
+cat("  Total fixed addition per year:     ",
+    dollar(round(eal_fixed_total)), "\n")
+
+agg_loss <- tornado_loss + sim_flood + sim_eq + eal_fixed_total
+
+#  skewness and kurtosis
+agg_mean   <- mean(agg_loss)
+agg_sd     <- sd(agg_loss)
+skewness_m <- (sum((agg_loss - agg_mean)^3) / N_sim) / agg_sd^3
+
+tibble(
+  Statistic = c("Mean ($)", "Median ($)", "SD ($)",
+                 "Skewness", "Kurtosis (excess)"),
+  Value     = c(dollar(round(mean(agg_loss))),
+                dollar(round(median(agg_loss))),
+                dollar(round(sd(agg_loss))),
+                round(skewness_m, 3),
+                round((sum((agg_loss - agg_mean)^4) / N_sim) / agg_sd^4 - 3, 2))
+) %>%
+  kable(caption = paste0(
+  "Aggregate annual loss — distributional summary (N = 100,000 simulated years). ")) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### Raw Monte Carlo Draws
+
+The exceedance curve that will be shown later is a summary of the
+simulation (ranks and sorts the 100,000 draws into a smooth curve).
+The plots below show the raw draws themselves, giving us a sense of
+what the simulation actually produced year-by-year. Because every
+simulated year includes the fixed point-estimate addition of other
+un-simulatated variables, no year has zero total loss. TO see the
+draws meaningfully, we only looked at the EAL for the three hazards
+individually instead of as the total EAL every yeay (because the added
+EAL from un-simulated hazards are too big, which makes the graph
+unreadable)
+
+```{r}
+#| label: mc-hazard-distributions
+#| fig-height: 12
+
+# Fixed point estimates for population and agriculture
+
+eal_flood_pop_agr <- eal_by_hc %>%
+  filter(nri_prefix %in% c("RFLD", "CFLD"),
+         consequence %in% c("Population", "Agriculture")) %>%
+  summarise(total = sum(EAL_hc, na.rm = TRUE)) %>%
+  pull(total)
+
+eal_eq_pop_agr <- eal_by_hc %>%
+  filter(nri_prefix == "ERQK",
+         consequence %in% c("Population", "Agriculture")) %>%
+  summarise(total = sum(EAL_hc, na.rm = TRUE)) %>%
+  pull(total)
+
+eal_tornado_pop_agr <- eal_by_hc %>%
+  filter(nri_prefix == "TRND",
+         consequence %in% c("Population", "Agriculture")) %>%
+  summarise(total = sum(EAL_hc, na.rm = TRUE)) %>%
+  pull(total)
+
+cat("Flood pop + agr fixed addition:     ",
+    dollar(round(eal_flood_pop_agr)), "\n")
+cat("Earthquake pop + agr fixed addition:",
+    dollar(round(eal_eq_pop_agr)), "\n")
+cat("Tornado pop + agr fixed addition:   ",
+    dollar(round(eal_tornado_pop_agr)), "\n")
+
+# Full-consequence simulated losses 
+
+# Tornado: building (simulated count × fixed mean building damage) + fixed pop and agr point estimates
+# Occurrence = any year where Poisson draw > 0
+tornado_bldg_loss <- sim_tornado * mean_dmg_per_tornado
+tornado_loss_full <- tornado_bldg_loss + eal_tornado_pop_agr
+tornado_occurred  <- sim_tornado > 0          # hurdle
+
+# Flood: simulated building loss + fixed pop and agr point estimates
+# Occurrence = any year where hurdle-Lognormal draw > 0
+flood_loss_full  <- sim_flood + eal_flood_pop_agr
+flood_occurred   <- sim_flood > 0             # hurdle
+
+# Earthquake: simulated building loss + fixed pop and agr point estimates
+# Occurrence = any year where hurdle-Lognormal draw > 0
+eq_loss_full     <- sim_eq + eal_eq_pop_agr
+eq_occurred      <- sim_eq > 0               # hurdle
+
+# Occurrence summary 
+tibble(
+  Hazard = c("Tornado", "Flood", "Earthquake"),
+  `Years with occurrence` = comma(c(
+    sum(tornado_occurred),
+    sum(flood_occurred),
+    sum(eq_occurred)
+  )),
+  `Years without occurrence` = comma(c(
+    sum(!tornado_occurred),
+    sum(!flood_occurred),
+    sum(!eq_occurred)
+  )),
+  `Pr(occurrence)` = round(c(
+    mean(tornado_occurred),
+    mean(flood_occurred),
+    mean(eq_occurred)
+  ), 4),
+  `Target Pr(occurrence)` = c(
+    round(1 - dpois(0, lambda_T), 4),
+    round(p_F_hat, 4),
+    p_E
+  )
+) %>%
+  kable(caption = paste0(
+    "Simulated occurrence counts across 100,000 annual loss years. ",
+    "Simulated probability should closely match target — ",
+    "any gap reflects Monte Carlo sampling noise."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Plot (The fixed pop + agr addition is included in every occurrence year)
+
+plot_occurrence_hist <- function(loss_vec, occurred_vec,
+                                 hazard_name, fill_color,
+                                 fixed_addition) {
+
+  n_occurred  <- sum(occurred_vec)
+  n_no_event  <- sum(!occurred_vec)
+
+  # Loss in occurrence years only
+  occ_losses <- loss_vec[occurred_vec]
+
+  ggplot(tibble(loss = occ_losses), aes(x = loss)) +
+    geom_histogram(bins = 100, fill = fill_color,
+                   color = "white", alpha = 0.85) +
+    geom_vline(xintercept = mean(occ_losses), linetype = "dashed",
+               color = "firebrick", linewidth = 0.9) +
+    geom_vline(xintercept = median(occ_losses), linetype = "dotted",
+               color = "darkgreen", linewidth = 0.9) +
+    annotate("text",
+             x = mean(occ_losses) * 1.1, y = Inf,
+             label = paste0("Mean (occ. yrs)\n",
+                            dollar(round(mean(occ_losses)))),
+             color = "firebrick", vjust = 1.5, hjust = 0, size = 3) +
+    annotate("text",
+             x = median(occ_losses) * 0.9, y = Inf,
+             label = paste0("Median (occ. yrs)\n",
+                            dollar(round(median(occ_losses)))),
+             color = "darkgreen", vjust = 1.5, hjust = 1, size = 3) +
+    scale_x_log10(labels = dollar_format(scale = 1e-6, suffix = "M")) +
+    scale_y_continuous(labels = comma_format()) +
+    labs(
+      title    = paste0(hazard_name,
+                        " — loss distribution in occurrence years only"),
+      subtitle = paste0(
+        comma(n_occurred),  " years with hazard occurrence | ",
+        comma(n_no_event),  " years with no occurrence (excluded) | ",
+        "loss includes building + population + agriculture"
+      ),
+      x = "Annual loss in occurrence year (log scale, $M)",
+      y = "Number of simulated years"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"))
+}
+
+p_tornado <- plot_occurrence_hist(
+  tornado_loss_full, tornado_occurred,
+  "Tornado",    "goldenrod",
+  fixed_addition = eal_tornado_pop_agr
+)
+
+p_flood <- plot_occurrence_hist(
+  flood_loss_full, flood_occurred,
+  "Flood",      "steelblue",
+  fixed_addition = eal_flood_pop_agr
+)
+
+p_eq <- plot_occurrence_hist(
+  eq_loss_full, eq_occurred,
+  "Earthquake", "firebrick",
+  fixed_addition = eal_eq_pop_agr
+)
+
+print(p_tornado / p_flood / p_eq)
+```
+
+### Exceedance Probability Curve
+
+This tells us, for any loss level indicated on the x-axis, we know the
+corresponding probability that a given year exceeds that loss. The
+more we look towards the right side of the graph, the more rare and
+catastrophic. The dashed line shows FEMA's single-point estimate.
+Again, because adding other components of the loss will make the graph
+unreadbale, we only include the simulated losses here (building).
+
+```{r}
+# Building-only FEMA EAL
+eal_3haz_bldg <- eal_by_hc %>%
+  filter(nri_prefix %in% c("TRND", "RFLD", "CFLD", "ERQK"),
+         consequence == "Building") %>%
+  summarise(eal = sum(EAL_hc, na.rm = TRUE)) %>%
+  pull(eal)
+
+# Stochastic building losses only — this is what has a real distribution
+agg_loss_bldg <- tornado_loss + sim_flood + sim_eq
+
+loss_sorted <- sort(agg_loss_bldg)
+n_total     <- length(loss_sorted)
+surv_prob   <- (n_total:1) / n_total
+
+idx_thin <- round(seq(1, n_total, length.out = 100000))
+surv_df  <- tibble(
+  loss = loss_sorted[idx_thin],
+  surv = surv_prob[idx_thin]
+) %>% filter(loss > 0, surv > 0)
+
+ggplot(surv_df, aes(x = loss, y = surv)) +
+  geom_line(color = "steelblue", linewidth = 0.75) +
+  geom_vline(xintercept = eal_3haz_bldg, linetype = "dashed",
+             color = "firebrick", linewidth = 0.9) +
+  annotate("text",
+           x = eal_3haz_bldg * 1.1, y = 0.25,
+           label = paste0("FEMA building EAL\n$", scales::comma(round(eal_3haz_bldg))),
+           color = "firebrick", hjust = 0, size = 3.2) +
+  scale_x_log10(labels = dollar_format(scale = 1e-6, suffix = "M")) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01)) +
+  labs(
+    title    = "Exceedance Probability Curve — Manhattan 3-Hazard Aggregate Annual Loss",
+    subtitle = paste0("Monte Carlo simulation (N = ", scales::comma(N_sim),
+                      " years) | Hazards: Tornado, Flood, Earthquake"),
+    x        = "Annual aggregate loss (log scale, $M)",
+    y        = "Annual exceedance probability"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Sensitivity Analysis
+
+**Method:** We use a Local One-at-a-Time (OAT) Sensitivity Analysis
+where each of the nine model parameters is individually perturbed to a
+plausible range of value while all other parameters are held at their
+current estimates. The full 100,000-year Monte Carlo simulation is
+re-run for every scenario, and we report three output statistics: mean
+aggregate annual building loss, 95th-percentile loss, and
+99th-percentile loss. We chose this method because we estimated all 9
+parameters independently (selection of 1 parameter had no impact of
+any other ones):
+
+1.  $\hat{\lambda}_T$ through Poisson MLE on county-level tornado
+    data;
+2.  $(\hat{p}_F, \hat{\mu}_F, \hat{\sigma}_F)$ through separate
+    Bernoulli and Lognormal MLEs on flood data;
+3.  $(p_E, \mu_E, \sigma_E)$ came from published seismic literature.
+4.  $(\nu, \rho_{TF})$ chosen to produce heavier joint tails and to
+    reflect a weak meteorological link between tornado and flood
+    occurrence, respectively.
+
+Due to the fact that these parameters are estimated from distinct data
+sources, interaction between parameters are negligible, making this
+method both appropriate and easy to implement. We set bounds for
+perturbation:
+
+1.  The tornado-rate bounds (×0.5, ×1.5) reflects the sampling
+    uncertainty inherent in having only 3 tornado events over 63 years
+    of record: $\hat{\lambda}_T = 0.047$, 95% CI: $[-0.006,\ 0.101]$.
+2.  The flood Bernoulli and Lognormal bounds are the asymptotic MLE
+    95% confidence intervals.\
+3.  The earthquake bounds span the full range cited across the
+    supporting literature.\
+4.  The copula $\nu$ goes from 3 to $\infty$ (Gaussian Copula) to
+    check the transition from heavy joint tails (Student-$t$) to the
+    tail-independence of the Gaussian copula.
+
+| Hazard     | Parameter        | Low             | Baseline | High              |
+|--------------|--------------|--------------|--------------|--------------|
+| Tornado    | $\lambda_T$      | $\times 0.50$   | MLE      | $\times 1.50$     |
+| Flood      | $\hat{p}_F$      | lower of 95% CI | MLE      | upper of 95% CI   |
+| Flood      | $\hat{\mu}_F$    | lower of 95% CI | MLE      | upper of 95% CI   |
+| Flood      | $\hat{\sigma}_F$ | lower of 95% CI | MLE      | upper of 95% CI   |
+| Earthquake | $p_E$            | 0.001           | 0.002    | 0.003             |
+| Earthquake | $\mu_E$          | 20.0            | 20.5     | 21.0              |
+| Earthquake | $\sigma_E$       | 0.7             | 1.0      | 1.3               |
+| Copula     | $\nu$            | 3 (heavy)       | 4        | 6 / 10 / $\infty$ |
+| Copula     | $\rho_{TF}$      | 0.00            | 0.05     | 0.15              |
+
+```{r}
+#|label: baseline-and-mc-function
+
+# Re-run the full MC for any combination of parameters, this way each scenario is self contained
+sa_run <- function(lam_T_in, p_F_in, mu_F_in, sig_F_in,
+                   p_E_in,   mu_E_in, sig_E_in,
+                   nu_in,    rho_in,
+                   seed = 42, N = N_sim) {
+  set.seed(seed)
+  Ps <- matrix(c(1,      rho_in, 0,
+                 rho_in, 1,      0,
+                 0,      0,      1), nrow = 3, byrow = TRUE)
+
+  # Handle when nu -> Inf vs a nu as a finite number
+  if (is.infinite(nu_in)) {
+    U <- pnorm(MASS::mvrnorm(N, mu = rep(0, 3), Sigma = Ps))
+  } else {
+    U <- pt(rmvt(N, sigma = Ps, df = nu_in), df = nu_in)
+  }
+
+  sim_T <- qpois(U[, 1], lambda = lam_T_in)
+  sim_F <- as.integer(U[, 2] <= p_F_in)  * qlnorm(runif(N), mu_F_in,  sig_F_in)
+  sim_E <- as.integer(U[, 3] <= p_E_in)  * qlnorm(runif(N), mu_E_in,  sig_E_in)
+  agg   <- sim_T * mean_dmg_per_tornado + sim_F + sim_E
+
+  tibble(
+    mean_loss = mean(agg),
+    p95_loss  = as.numeric(quantile(agg, 0.95)),
+    p99_loss  = as.numeric(quantile(agg, 0.99))
+  )
+}
+
+# Baseline (our original extimated parameter)
+sa_base <- sa_run(
+  lam_T_in = lambda_T, p_F_in   = p_F_hat, mu_F_in  = mu_F,    sig_F_in = sigma_F,
+  p_E_in   = p_E,      mu_E_in  = mu_E,    sig_E_in = sigma_E,
+  nu_in    = nu,       rho_in   = 0.05
+)
+
+cat("Sensitivity Analysis baseline — Mean:", dollar(round(sa_base$mean_loss)),
+    "| P95:", dollar(round(sa_base$p95_loss)),
+    "| P99:", dollar(round(sa_base$p99_loss)), "\n")
+```
+
+**Note:** Notice the baseline mean us higher than the 95th percentile.
+This is not a bug, but rather it is the result of a aggregate
+distribution with fat tail. Because in our data, most years have
+near-zero loss but some years experience catastrophic event. The tail
+event will drag the mean above the 95th percentile.
+
+```{r}
+#|label: CI-bound-for-Flood
+
+# Bernoulli: using the 95% we got from section 2.4
+p_F_lo <- max(0, p_F_hat - 1.96 * p_F_se)
+p_F_hi <- min(1, p_F_hat + 1.96 * p_F_se)
+
+# Lognormal
+n_fl <- n_flood_loss_years
+
+mu_F_lo  <- mu_F    - 1.96 * flood_fit$sd["meanlog"]
+mu_F_hi  <- mu_F    + 1.96 * flood_fit$sd["meanlog"]
+sig_F_lo <- sigma_F - 1.96 * flood_fit$sd["sdlog"]
+sig_F_hi <- sigma_F + 1.96 * flood_fit$sd["sdlog"]
+
+tibble(
+  Bound          = c("p_F low (95% CI)", "p_F high (95% CI)",
+                     "mu_F low (95% CI)", "mu_F high (95% CI)",
+                     "sigma_F low (95% CI)", "sigma_F high (95% CI)"),
+  Value          = round(c(p_F_lo, p_F_hi, mu_F_lo, mu_F_hi, sig_F_lo, sig_F_hi), 4),
+  `Baseline`     = round(c(p_F_hat, p_F_hat, mu_F, mu_F, sigma_F, sigma_F), 4)
+) %>%
+  kable(caption = "Flood parameters perturbation bounds — MLE 95% confidence intervals") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r}
+#|label: scenario
+
+# Each row is one scenario of sensitivity analysis.
+
+sa_grid <- tribble(
+  ~group,        ~param_id,    ~direction, ~label,
+  ~lam_T_v,          ~p_F_v,   ~mu_F_v, ~sig_F_v,
+  ~p_E_v,            ~mu_E_v,  ~sig_E_v,
+  ~nu_v,             ~rho_v,
+
+# Baseline
+  "Baseline",    "baseline",   "base",    "Baseline",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.05,
+
+# Tornado: lambda_T
+  "Tornado",     "lambda_T",   "low",     "lambda_T x0.50  (sparse-data lower)",
+  lambda_T*0.5,      p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.05,
+
+  "Tornado",     "lambda_T",   "high",    "lambda_T x1.50  (sparse-data upper)",
+  lambda_T*1.5,      p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.05,
+
+# Flood: p_F
+  "Flood",       "p_F",        "low",     "p_F  95% CI lower",
+  lambda_T,          p_F_lo,   mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.05,
+
+  "Flood",       "p_F",        "high",    "p_F  95% CI upper",
+  lambda_T,          p_F_hi,   mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.05,
+
+# Flood: mu_F
+  "Flood",       "mu_F",       "low",     "mu_F  MLE 95% CI lower",
+  lambda_T,          p_F_hat,  mu_F_lo, sigma_F,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.05,
+
+  "Flood",       "mu_F",       "high",    "mu_F  MLE 95% CI upper",
+  lambda_T,          p_F_hat,  mu_F_hi, sigma_F,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.05,
+
+# Flood: sigma_F 
+  "Flood",       "sigma_F",    "low",     "sigma_F  MLE 95% CI lower",
+  lambda_T,          p_F_hat,  mu_F,    sig_F_lo,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.05,
+
+  "Flood",       "sigma_F",    "high",    "sigma_F  MLE 95% CI upper",
+  lambda_T,          p_F_hat,  mu_F,    sig_F_hi,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.05,
+
+# Earthquake: p_E
+  "Earthquake",  "p_E",        "low",     "p_E = 0.001  (literature lower)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  0.001,             mu_E,     sigma_E,
+  nu,                0.05,
+  
+"Earthquake",  "p_E",        "high",    "p_E = 0.003  (literature upper)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  0.003,             mu_E,     sigma_E,
+  nu,                0.05,
+
+# Earthquake: mu_E
+  "Earthquake",  "mu_E",       "low",     "mu_E = 20.0  (lower literature)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               20.0,     sigma_E,
+  nu,                0.05,
+
+  "Earthquake",  "mu_E",       "high",    "mu_E = 21.0  (upper literature)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               21.0,     sigma_E,
+  nu,                0.05,
+
+# Earthquake: sigma_E
+  "Earthquake",  "sigma_E",    "low",     "sigma_E = 0.7  (HAZUS lower)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     0.7,
+  nu,                0.05,
+
+  "Earthquake",  "sigma_E",    "high",    "sigma_E = 1.3  (HAZUS upper)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     1.3,
+  nu,                0.05,
+
+# Copula: nu
+  "Copula",      "nu",         "low",     "nu = 3  (heaviest joint tail)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  3,                 0.05,
+
+  "Copula",      "nu",         "high_6",  "nu = 6",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  6,                 0.05,
+
+  "Copula",      "nu",         "high_10", "nu = 10",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  10,                0.05,
+
+  "Copula",      "nu",         "high",    "nu = Inf  (Gaussian copula)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  Inf,               0.05,
+
+# Copula: rho_TF
+  "Copula",      "rho_TF",     "low",     "rho_TF = 0.00  (independence)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.00,
+
+  "Copula",      "rho_TF",     "high",    "rho_TF = 0.15  (moderate weather link)",
+  lambda_T,          p_F_hat,  mu_F,    sigma_F,
+  p_E,               mu_E,     sigma_E,
+  nu,                0.15
+)
+```
+
+```{r}
+# Running all scenarios
+sa_results <- sa_grid %>%
+  mutate(
+    res = pmap(
+      list(lam_T_v, p_F_v, mu_F_v, sig_F_v,
+           p_E_v,   mu_E_v, sig_E_v,
+           nu_v,    rho_v),
+      function(a, b, c, d, e, f, g, h, i)
+        sa_run(lam_T_in = a, p_F_in   = b, mu_F_in  = c, sig_F_in = d,
+               p_E_in   = e, mu_E_in  = f, sig_E_in = g,
+               nu_in    = h, rho_in   = i)
+    )
+  ) %>%
+  unnest(res) %>%
+  mutate(
+    chg_mean = (mean_loss - sa_base$mean_loss) / sa_base$mean_loss * 100,
+    chg_p95  = (p95_loss  - sa_base$p95_loss)  / sa_base$p95_loss  * 100,
+    chg_p99  = (p99_loss  - sa_base$p99_loss)  / sa_base$p99_loss  * 100
+  )
+```
+
+```{r}
+
+# sensitivity table for each hazard
+# function to make table for each hazard
+sa_table <- function(grp, caption_text) {
+  sa_results %>%
+    filter(group %in% c("Baseline", grp)) %>%
+    transmute(
+      Scenario        = label,
+      `Mean Loss`     = dollar(round(mean_loss)),
+      `Delta Mean`    = ifelse(direction == "base", "—",
+                               sprintf("%+.3f%%", chg_mean)),
+      `95th Pct`      = dollar(round(p95_loss)),
+      `Delta P95`     = ifelse(direction == "base", "—",
+                               sprintf("%+.3f%%", chg_p95)),
+      `99th Pct`      = dollar(round(p99_loss)),
+      `Delta P99`     = ifelse(direction == "base", "—",
+                               sprintf("%+.3f%%", chg_p99))
+    ) %>%
+    kable(caption = caption_text, align = c("l","r","r","r","r","r","r")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE) %>%
+    row_spec(1, bold = TRUE, background = "#f5f5f5")   # highlight baseline row
+}
+```
+
+#### Tornado: Sensitivity to Annual Frequency Rate ($\lambda_T$)
+
+The Poisson rate $\lambda_T = 0.047$ was estimated from only 3 tornado
+events in 63 years of record, giving a wide 95% CI of
+$[-0.006, 0.101]$. We updated this parameter by $\pm 50\%$ because
+tornado building damage per event is small (FEMA reported an average
+of \$22{,}681), so even a $150\%$ rate result in a mild effect on
+aggregate loss.
+
+```{r}
+#|label: Tornado-sa
+sa_table("Tornado",
+         "Tornado sensitivity — lambda_T perturbed ±50% from MLE baseline")
+```
+
+#### Flood: Sensitivity to Bernoulli (Occurrence) and Lognormal (Severity)
+
+We tested all three flood parameters, which are the Bernoulli
+probability $\hat{p}_F$ and the Lognormal parameters
+$(\hat{\mu}_F, \hat{\sigma}_F)$. We shifted each of them to the 95% CI
+of MLE. Because the flood distribution has a fat right tail, the
+severity parameters ($\mu_F$, $\sigma_F$) tend to have a
+disproportionately large effect on the 99th-percentile loss relative.
+
+```{r}
+#|label: Flood-sa
+sa_table("Flood",
+         "Flood sensitivity — p_F, mu_F, and sigma_F at MLE 95% CI bounds")
+```
+
+#### Earthquake: Sensitivity to Bernoulli (Occurrence) and Lognormal (Severity)
+
+We derived all earthquake parameters from external literature rather
+than fitting them using historical data. The occurrence probability
+$p_E$ spans the $[0.001, 0.003]$ range as backed by literature. The
+severity parameters $\mu_E$ and $\sigma_E$ are shifted by $\pm 0.5$
+log-units and $\pm 0.3$, respectively.
+
+```{r}
+#|label: Earthquake-sa
+sa_table("Earthquake",
+         "Earthquake sensitivity — p_E, mu_E, and sigma_E at literature bounds")
+```
+
+#### Sensitivity of 99th-Percentile Aggregate Loss
+
+The tornado diagram (name of the diagram, not the hazard) below ranks
+all parameters by the total range of change they produce in the
+99th-percentile of aggregate loss. This diagram answers the question
+of: "which parameter, if we are wrong about it, threatens our estimate
+of catastrophic loss the most?" Each bar shows the change from
+baseline when the parameter is set to its low (left, negative) or high
+(right, positive) value. The parameter whose bars extend furthest from
+center dominate the uncertainty in tail of our risk distr
+
+```{r}
+# Build the low/high range for the P99 tornado diagram.
+# For nu, use the most extreme perturbed value on each side.
+tornado_df <- sa_results %>%
+  filter(group != "Baseline") %>%
+  group_by(group, param_id) %>%
+  summarise(
+    lo_p99 = min(chg_p99),
+    hi_p99 = max(chg_p99),
+    lo_p95 = min(chg_p95),
+    hi_p95 = max(chg_p95),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    range_p99 = hi_p99 - lo_p99,
+    y_label = case_when(
+      param_id == "lambda_T" ~ "lambda_T  (Tornado rate)",
+      param_id == "p_F"      ~ "p_F  (Flood occurrence)",
+      param_id == "mu_F"     ~ "mu_F  (Flood log-mean)",
+      param_id == "sigma_F"  ~ "sigma_F  (Flood log-SD)",
+      param_id == "p_E"      ~ "p_E  (EQ occurrence)",
+      param_id == "mu_E"     ~ "mu_E  (EQ log-mean)",
+      param_id == "sigma_E"  ~ "sigma_E  (EQ log-SD)",
+      param_id == "nu"       ~ "nu  (Copula d.f.)",
+      param_id == "rho_TF"   ~ "rho_TF  (Tornado-Flood corr.)"
+    )
+  ) %>%
+  arrange(range_p99)
+
+tornado_df$y_label <- factor(tornado_df$y_label, levels = tornado_df$y_label)
+
+# Labels for the y-axis
+param_label_plain <- c(
+  lambda_T = "λ_T  (Tornado rate)",
+  p_F      = "p̂_F  (Flood occurrence)",
+  mu_F     = "μ̂_F  (Flood log-mean)",
+  sigma_F  = "σ̂_F  (Flood log-SD)",
+  p_E      = "p_E  (EQ occurrence)",
+  mu_E     = "μ_E  (EQ log-mean)",
+  sigma_E  = "σ_E  (EQ log-SD)",
+  nu       = "ν    (Copula d.f.)",
+  rho_TF   = "ρ_TF (Tornado–Flood corr.)"
+)
+tornado_df <- tornado_df  %>% 
+  mutate(y_label = param_label_plain[param_id])
+tornado_df$y_label <- factor(tornado_df$y_label,
+                              levels = tornado_df$y_label)  # preserve sort order
+
+# Colour by hazard group
+group_colours <- c(
+  Tornado    = "goldenrod",
+  Flood      = "steelblue",
+  Earthquake = "firebrick",
+  Copula     = "mediumpurple"
+)
+
+p_tornado_diag <- ggplot(tornado_df) +
+
+# Zero-line (baseline)
+  geom_vline(xintercept = 0, colour = "grey40", linewidth = 0.6) +
+
+# Low half (left side)
+  geom_segment(aes(x = lo_p99, xend = 0,
+                   y = y_label,  yend = y_label,
+                   colour = group),
+               linewidth = 7, lineend = "butt", alpha = 0.85) +
+
+# High half (right side)
+  geom_segment(aes(x = 0, xend = hi_p99,
+                   y = y_label,  yend = y_label,
+                   colour = group),
+               linewidth = 7, lineend = "butt", alpha = 0.85) +
+
+# Numeric labels on each end
+  geom_text(aes(x = lo_p99 - 0.5, y = y_label,
+                label = sprintf("%.1f%%", lo_p99)),
+            hjust = 1, size = 3, colour = "grey30") +
+  geom_text(aes(x = hi_p99 + 0.5, y = y_label,
+                label = sprintf("+%.1f%%", hi_p99)),
+            hjust = 0, size = 3, colour = "grey30") +
+  scale_colour_manual(values = group_colours, name = "Hazard group") +
+  scale_x_continuous(
+    labels = function(x) paste0(ifelse(x >= 0, "+", ""), round(x), "%"),
+    expand = expansion(mult = c(0.18, 0.18))
+  ) +
+  labs(
+    title    = "Sensitivity of 99th-Percentile Aggregate Loss",
+    subtitle = paste0("Each bar shows the % change in P99 when a single parameter is moved to its low (left) or high (right) bound.\n",
+                      "Parameters sorted by total range (widest = most influential)."),
+    x        = "% change in 99th-percentile aggregate annual building loss",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 9, colour = "grey40"),
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+print(p_tornado_diag)
+```
+
+#### Copula's Sensitivity (To Tail-Dependence Strength ($\nu$) and Tornado–Flood Correlation ($\rho_{TF}$))
+
+The degrees-of-freedom parameter $\nu$ of t-Copula tells us how much
+joint tail probability are placed on scenarios where multiple hazards
+are extreme simultaneously. As $\nu \to \infty$ the t-Copula converges
+to the Gaussian copula, which has zero tail dependence. We range
+$\nu \in \{3, 4, 6, 10, \infty\}$ to check how strongly our tail-risk
+estimates depend on our choice for this parameter. The correlation
+$\rho_{TF}$ ranges from full independence (0) to a moderate
+weather-driven link (0.15).
+
+```{r}
+sa_table("Copula",
+         "Copula sensitivity — nu (degrees of freedom) and rho_TF (Tornado-Flood correlation)")
+```
+
+The degrees-of-freedom parameter $\nu$ is a choice rather than an
+estimated scalar. As $\nu$ decreases, joint tail events become more
+likely, while leaving the mean almost the same. This is a signature of
+tail dependence that a Gaussian copula ($\nu \to \infty$) would misse
+entirely.
+
+```{r}
+nu_sweep_df <- sa_results %>%
+  filter(param_id == "nu" | direction == "base") %>%
+  # Recover the nu value for each row
+  mutate(nu_val = case_when(
+    direction == "base"     ~ as.numeric(nu),   # baseline nu (from env)
+    grepl("nu = 3",  label) ~ 3,
+    grepl("nu = 6",  label) ~ 6,
+    grepl("nu = 10", label) ~ 10,
+    grepl("Gaussian",label) ~ Inf,
+    TRUE                    ~ NA_real_
+  )) %>%
+  filter(!is.na(nu_val)) %>%
+  # For Inf, use a large finite value so the x-axis looks clean
+  mutate(nu_plot = ifelse(is.infinite(nu_val), 40, nu_val)) %>%
+  select(nu_val, nu_plot, mean_loss, p95_loss, p99_loss) %>%
+  pivot_longer(cols = c(mean_loss, p95_loss, p99_loss),
+               names_to = "stat", values_to = "loss") %>%
+  mutate(stat = recode(stat,
+                       mean_loss = "Mean",
+                       p95_loss  = "95th percentile",
+                       p99_loss  = "99th percentile"))
+
+p_nu_sweep <- ggplot(nu_sweep_df, aes(x = nu_plot, y = loss / 1e6,
+                                       colour = stat, group = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(
+    breaks = c(3, 4, 6, 10, 40),
+    labels = c("3", "4", "6", "10", "Gaussian\n(∞)")
+  ) +
+  scale_y_continuous(labels = dollar_format(suffix = "M", scale = 1)) +
+  scale_colour_manual(
+    values = c("Mean" = "grey50",
+               "95th percentile" = "steelblue",
+               "99th percentile" = "firebrick"),
+    name = NULL
+  ) +
+  labs(
+    title    = "Copula Degrees-of-Freedom Sweep — Effect on Aggregate Loss Statistics",
+    x        = "Copula degrees of freedom (nu)",
+    y        = "Aggregate annual building loss ($M)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+print(p_nu_sweep)
+```
+
+# Conclusion
+The main goal of my project is to make the point that FEMA's National Risk Index, by reporting a single mean-based Expected Annual Loss, hides more than it reveals about the true risk faced by our communities. The reconstruction of the NRI for New York County (Manhattan) confirmed that the EAL formula — Exposure × Annualized Frequency × Historic Loss Ratio — can be closely replicated. Although our composite EAL of $\$476M$ is about $155.3%$ of FEMA's published $\$306.7M$, which is a discrepancy attributable to differences in SHELDUS date ranges and FEMA's proprietary pre-processing. Our Coefficient of Variation (CV) analysis showed that for most hazards at the county scale, the mean loss ratio seems to be dominated by a handful of extreme events rather than the typical year. Having tail events like this is precisely why I wanted to highlight the flaw in collapsing the entire distribution into a single number. Because with just one number, we have no room to see that most years experience none to minimal hazard losses but a few experiences catastrophic losses.
+
+This point is illustrated using a Monte Carlo simulation. Across our 100,000 simulated years, the aggregate annual building loss for the three simulated hazards had a mean of $\$15.8M$ with a standard deviation of $\$665M$ and skewness of 195. We also see that our distribution so right-skewed that the mean sits above the 95th percentile. Our exceedance probability curve showed what FEMA's single estimate wasn't able to show, which is that there is a probable chance of a year with near-zero loss, but also a non-trivial amount of scenarios where a major flood or earthquake produces losses in the hundreds of millions or more. Then our sensitivity analysis further showed that the flood log-severity parameter (σ̂_F) is the most influential source of uncertainty in the tail, with its upper 95% CI bound increasing the 99th-percentile loss by over 400%, while the copula's degrees-of-freedom parameter confirmed that our choice of a t-Copula instead of a Gaussian copula was warranted because the Gaussian copula's lack of ability to account for tail independence.
+
+The above findings taken together suggest that any risk communication framework that reports only a mean EAL without an accompanying distribution is probably inadequate for important decisions that depend on tail outcomes. For example, infrastructure investment, insurance pricing, emergency reserve planning, and long-term fiscal resilience. For a county like Manhattan, where building exposure per square mile is the highest in New York State and most of the United States, a rare but plausible earthquake or major flood event can lead to losses way above the annual average computed in FEMA's NRI. 
